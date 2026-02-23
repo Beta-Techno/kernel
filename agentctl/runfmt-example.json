@@ -1,0 +1,46 @@
+{
+  "version": "runfmt/0.1",
+  "kind": "code_pr",
+  "target": {
+    "repo": "github.com/example/repo",
+    "base_ref": "main",
+    "subdir": null,
+    "workspace_mode": "worktree"
+  },
+  "agent": {
+    "driver": "codex_exec",
+    "model_hint": "gpt-5-codex",
+    "prompt": "Test prompt",
+    "context_files": [],
+    "personality": null
+  },
+  "env": {
+    "profile": "auto",
+    "setup": []
+  },
+  "authority": {
+    "mode": 1,
+    "capabilities": [
+      {"name": "repo.read"}
+    ]
+  },
+  "tools": {
+    "mcp_profile": "docs",
+    "command_policy": "deny",
+    "network": "deny"
+  },
+  "budgets": {
+    "wall_seconds": 600
+  },
+  "acceptance": {
+    "commands": [],
+    "receipts_required": false
+  },
+  "outputs": {
+    "want_patch": true,
+    "want_commits": true,
+    "want_handoff": true,
+    "push_branch": false,
+    "open_pr": false
+  }
+}

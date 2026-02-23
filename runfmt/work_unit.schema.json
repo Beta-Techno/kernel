@@ -1,0 +1,169 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kernel.local/runfmt/work_unit.schema.json",
+  "title": "runfmt/0.1 WorkUnit",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "kind",
+    "target",
+    "agent",
+    "env",
+    "authority",
+    "tools",
+    "budgets",
+    "acceptance",
+    "outputs"
+  ],
+  "properties": {
+    "version": {
+      "type": "string",
+      "const": "runfmt/0.1"
+    },
+    "id": {
+      "type": "string",
+      "description": "Client-supplied identifier or hint; kernel will assign if absent.",
+      "pattern": "^[A-Za-z0-9_.:-]{0,128}$"
+    },
+    "kind": {
+      "type": "string",
+      "enum": ["code_pr", "ops", "hybrid"],
+      "description": "Determines default authority ladder and artifact expectations."
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repo", "base_ref"],
+      "properties": {
+        "repo": {"type": "string", "description": "Canonical repo identifier or URL."},
+        "base_ref": {"type": "string", "description": "Branch or commit hash to base the workspace on."},
+        "subdir": {"type": ["string", "null"], "description": "Optional subdirectory focus."},
+        "workspace_mode": {
+          "type": "string",
+          "enum": ["worktree", "clone", "scratch"],
+          "default": "worktree"
+        }
+      }
+    },
+    "agent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["driver", "prompt"],
+      "properties": {
+        "driver": {
+          "type": "string",
+          "description": "Executable adapter name (e.g. codex_exec, claude_code)."
+        },
+        "model_hint": {"type": "string"},
+        "prompt": {"type": "string", "minLength": 1},
+        "context_files": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "Optional relative paths to include up front."
+        },
+        "personality": {"type": ["string", "null"]}
+      }
+    },
+    "env": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["profile"],
+      "properties": {
+        "profile": {
+          "type": "string",
+          "enum": ["auto", "devcontainer", "nix", "mise", "native"],
+          "default": "auto"
+        },
+        "setup": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "Optional preparatory commands (policy-gated)."
+        }
+      }
+    },
+    "authority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "capabilities"],
+      "properties": {
+        "mode": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 3,
+          "description": "Autonomy ladder level (0=read-only, 3=irreversible ops)."
+        },
+        "capabilities": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name"],
+            "properties": {
+              "name": {"type": "string"},
+              "scope": {"type": "string"},
+              "ttl_seconds": {"type": "integer", "minimum": 1},
+              "metadata": {"type": "object"}
+            }
+          }
+        }
+      }
+    },
+    "tools": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mcp_profile", "command_policy", "network"],
+      "properties": {
+        "mcp_profile": {"type": "string", "description": "Named allowlist bundle."},
+        "command_policy": {
+          "type": "string",
+          "enum": ["deny", "safe-default", "allow-listed", "full"],
+          "default": "safe-default"
+        },
+        "network": {
+          "type": "string",
+          "enum": ["deny", "egress-limited", "allow"],
+          "default": "deny"
+        }
+      }
+    },
+    "budgets": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["wall_seconds"],
+      "properties": {
+        "wall_seconds": {"type": "integer", "minimum": 60},
+        "max_tool_calls": {"type": "integer", "minimum": 0},
+        "max_commands": {"type": "integer", "minimum": 0},
+        "max_bytes_written": {"type": "integer", "minimum": 0},
+        "max_diff_lines": {"type": "integer", "minimum": 0}
+      }
+    },
+    "acceptance": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "commands": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "Commands to run after agent exits; kernel enforces."
+        },
+        "receipts_required": {
+          "type": "boolean",
+          "default": false
+        }
+      }
+    },
+    "outputs": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "want_patch": {"type": "boolean", "default": true},
+        "want_commits": {"type": "boolean", "default": true},
+        "want_handoff": {"type": "boolean", "default": true},
+        "push_branch": {"type": "boolean", "default": false},
+        "open_pr": {"type": "boolean", "default": false}
+      }
+    }
+  }
+}
