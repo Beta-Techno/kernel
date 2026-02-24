@@ -86,6 +86,15 @@ pub fn write_handoff(path: &Path, run_id: &str, work_unit: &WorkUnit, status: &s
     Ok(())
 }
 
+pub fn write_handoff_disabled(path: &Path, run_id: &str, status: &str) -> Result<()> {
+    let mut file = File::create(path)?;
+    writeln!(file, "# Handoff Disabled")?;
+    writeln!(file, "- **Run:** {}", run_id)?;
+    writeln!(file, "- **Status:** {}", status)?;
+    writeln!(file, "- **Reason:** outputs.want_handoff is false")?;
+    Ok(())
+}
+
 pub fn write_env_fingerprint(path: &Path) -> Result<()> {
     let hostname = whoami::fallible::hostname().unwrap_or_else(|_| "unknown".to_string());
     let info = serde_json::json!({

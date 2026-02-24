@@ -9,3 +9,14 @@ Layer 1 of the autonomous minds substrate: a minimal, verifiable kernel that run
 - `runfmt/artifacts.md` — artifact bundle contract (RUN.json, HANDOFF, receipts, etc.).
 
 Everything else (CLI, daemon, MCP gateway) will target this ABI.
+
+## agentctl
+
+`agentctl` is the first Layer 1 runner implementation.
+
+Core commands:
+
+- `cargo run -- run --spec /path/to/work-unit.json`
+- `cargo run -- list --limit 20`
+- `cargo run -- show <run_id>`
+- `cargo run -- rerun <run_id>`

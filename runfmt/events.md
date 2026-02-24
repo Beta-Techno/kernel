@@ -26,6 +26,7 @@ Events are append-only. New event types may be added in backwards-compatible way
 | `agent.exited` | `{ "exit_code": 0, "reason": "completed" }` |
 | `run.interrupted` | `{ "reason": "operator", "signal": "SIGTERM" }` |
 | `run.finished` | `{ "status": "ok|failed|canceled", "summary_ref": "RUN.json" }` |
+| `artifact.skipped` | `{ "artifact": "artifacts/diff.patch", "reason": "outputs.want_patch=false" }` |
 
 ## Policy & Budgets
 
@@ -41,6 +42,7 @@ Events are append-only. New event types may be added in backwards-compatible way
 | ---- | ---- |
 | `git.status` | `{ "clean": false, "tracked": 2, "untracked": 1 }` |
 | `git.diff.stats` | `{ "files": 1, "insertions": 12, "deletions": 0 }` |
+| `git.commits` | `{ "count": 2, "artifact": "artifacts/commits.json" }` |
 | `file.write` | `{ "path": "AGENT_KERNEL_SMOKE_TEST.md", "bytes": 128 }` (coarse-grained) |
 
 ## Commands & Tools

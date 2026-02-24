@@ -184,6 +184,7 @@ pub fn execute(
     }
 
     let git_artifacts = write_git_artifacts(work_unit, paths, events)?;
+    write_commits_artifact(work_unit, paths, events)?;
     if enforce_budget_limit(
         events,
         "max_diff_lines",
@@ -214,6 +215,9 @@ pub fn execute(
             )?;
             final_status = RunStatus::Failed;
         }
+    }
+    if enforce_output_action_policy(work_unit, events)? {
+        final_status = RunStatus::Failed;
     }
     let finished_at = run_id::timestamp();
     let wall_seconds = timer.elapsed().as_secs();
@@ -252,12 +256,19 @@ pub fn execute(
     };
 
     artifacts::write_run_json(&paths.run_dir.join("RUN.json"), &record)?;
-    artifacts::write_handoff(
-        &paths.run_dir.join(&handoff_ref),
-        run_id,
-        work_unit,
-        record.status.as_str(),
-    )?;
+    let handoff_path = paths.run_dir.join(&handoff_ref);
+    if work_unit.outputs.want_handoff {
+        artifacts::write_handoff(&handoff_path, run_id, work_unit, record.status.as_str())?;
+    } else {
+        events.emit(
+            "artifact.skipped",
+            &serde_json::json!({
+                "artifact": handoff_ref,
+                "reason": "outputs.want_handoff=false",
+            }),
+        )?;
+        artifacts::write_handoff_disabled(&handoff_path, run_id, record.status.as_str())?;
+    }
     artifacts::write_env_fingerprint(&paths.run_dir.join("env_fingerprint.json"))?;
 
     events.emit(
@@ -578,9 +589,20 @@ fn write_git_artifacts(
         });
     }
 
-    let diff = git_capture(&paths.workspace_dir, ["diff", "--binary"])
-        .context("failed to compute git diff for artifact")?;
-    fs::write(&diff_path, &diff.stdout)?;
+    if work_unit.outputs.want_patch {
+        let diff = git_capture(&paths.workspace_dir, ["diff", "--binary"])
+            .context("failed to compute git diff for artifact")?;
+        fs::write(&diff_path, &diff.stdout)?;
+    } else {
+        fs::write(&diff_path, [])?;
+        events.emit(
+            "artifact.skipped",
+            &serde_json::json!({
+                "artifact": "artifacts/diff.patch",
+                "reason": "outputs.want_patch=false",
+            }),
+        )?;
+    }
 
     let status = git_capture(&paths.workspace_dir, ["status", "--porcelain"])?;
     let summary = parse_status_summary(&status.stdout);
@@ -619,6 +641,48 @@ fn write_git_artifacts(
         diff_lines,
         bytes_written,
     })
+}
+
+fn write_commits_artifact(
+    work_unit: &WorkUnit,
+    paths: &RunPaths,
+    events: &mut EventWriter,
+) -> Result<()> {
+    let commits_path = paths.artifacts_dir.join("commits.json");
+    if !work_unit.outputs.want_commits {
+        fs::write(&commits_path, b"[]\n")?;
+        events.emit(
+            "artifact.skipped",
+            &serde_json::json!({
+                "artifact": "artifacts/commits.json",
+                "reason": "outputs.want_commits=false",
+            }),
+        )?;
+        return Ok(());
+    }
+    if work_unit.target.workspace_mode == WorkspaceMode::Scratch
+        || !is_git_repo_root(&paths.workspace_dir)
+    {
+        fs::write(&commits_path, b"[]\n")?;
+        return Ok(());
+    }
+
+    let range = format!("{}..HEAD", work_unit.target.base_ref);
+    let out = git_capture(
+        &paths.workspace_dir,
+        ["log", "--reverse", "--format=%H%x09%s", &range],
+    )
+    .context("failed to collect git commits for artifact")?;
+    let commits = parse_commit_log(&out.stdout);
+    fs::write(&commits_path, serde_json::to_vec_pretty(&commits)?)?;
+    events.emit(
+        "git.commits",
+        &serde_json::json!({
+            "count": commits.len(),
+            "artifact": "artifacts/commits.json",
+        }),
+    )?;
+    Ok(())
 }
 
 fn prepare_workspace(work_unit: &WorkUnit, run_id: &str, paths: &RunPaths) -> Result<()> {
@@ -1199,6 +1263,44 @@ fn count_receipt_files(receipts_dir: &Path) -> Result<u64> {
     Ok(count)
 }
 
+fn enforce_output_action_policy(work_unit: &WorkUnit, events: &mut EventWriter) -> Result<bool> {
+    let mut denied = false;
+    if work_unit.outputs.push_branch {
+        events.emit(
+            "policy.denied",
+            &serde_json::json!({
+                "capability": "outputs.push_branch",
+                "reason": "not_implemented",
+            }),
+        )?;
+        denied = true;
+    }
+    if work_unit.outputs.open_pr {
+        events.emit(
+            "policy.denied",
+            &serde_json::json!({
+                "capability": "outputs.open_pr",
+                "reason": "not_implemented",
+            }),
+        )?;
+        denied = true;
+    }
+    Ok(denied)
+}
+
+fn parse_commit_log(stdout: &[u8]) -> Vec<serde_json::Value> {
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .filter_map(|line| {
+            let (sha, subject) = line.split_once('\t')?;
+            Some(serde_json::json!({
+                "sha": sha,
+                "subject": subject,
+            }))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1312,6 +1414,16 @@ mod tests {
         fs::write(nested.join("two.json"), b"{}").expect("write nested receipt");
         let count = count_receipt_files(&root).expect("count receipts");
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn parses_commit_log_lines() {
+        let lines = b"abc123\tfirst commit\ndef456\tsecond commit\n";
+        let commits = parse_commit_log(lines);
+        assert_eq!(commits.len(), 2);
+        assert_eq!(commits[0]["sha"], "abc123");
+        assert_eq!(commits[0]["subject"], "first commit");
+        assert_eq!(commits[1]["sha"], "def456");
     }
 
     #[test]

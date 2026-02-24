@@ -19,7 +19,7 @@ pub struct RunPaths {
 }
 
 pub fn provision(run_id: &str, _workspace_mode: WorkspaceMode) -> Result<RunPaths> {
-    let root = default_root();
+    let root = root();
     let runs_dir = root.join("runs");
     let worktrees_dir = root.join("worktrees");
     let repos_dir = root.join("repos");
@@ -60,7 +60,7 @@ pub fn provision(run_id: &str, _workspace_mode: WorkspaceMode) -> Result<RunPath
     })
 }
 
-fn default_root() -> PathBuf {
+pub fn root() -> PathBuf {
     if let Ok(root) = std::env::var("AGENTD_ROOT") {
         return PathBuf::from(root);
     }

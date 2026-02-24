@@ -25,6 +25,16 @@ runs/<run_id>/
 
 Workspaces live under `{root}/worktrees/<run_id>/`. For scratch runs the workspace is an empty directory; for worktree mode it is a git worktree checked out from the repo cache.
 
+## Output Flags
+
+WorkUnit `outputs.*` flags control artifact intent, but files remain schema-stable:
+
+- `want_patch = false` still creates `artifacts/diff.patch` as an empty file.
+- `want_commits = false` still creates `artifacts/commits.json` as `[]`.
+- `want_handoff = false` still creates `HANDOFF.md` with a disabled marker.
+
+Skipped artifacts are recorded in `events.norm.jsonl` as `artifact.skipped`.
+
 ## RUN.json (schema excerpt)
 
 `runfmt/run_record.schema.json` formalizes the structure. Key fields:
