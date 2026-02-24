@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kernel.local/runfmt/run_record.schema.json",
+  "title": "runfmt/0.1 Run Record",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "run_id",
+    "version",
+    "kind",
+    "status",
+    "driver",
+    "started_at",
+    "finished_at",
+    "spec",
+    "workspace",
+    "budgets_used",
+    "changed_files",
+    "validation",
+    "artifacts"
+  ],
+  "properties": {
+    "run_id": {"type": "string"},
+    "version": {"type": "string", "const": "runfmt/0.1"},
+    "kind": {"type": "string", "enum": ["code_pr", "ops", "hybrid"]},
+    "status": {"type": "string", "enum": ["ok", "failed", "needs_human"]},
+    "driver": {"type": "string"},
+    "started_at": {"type": "string", "format": "date-time"},
+    "finished_at": {"type": "string", "format": "date-time"},
+    "spec": {
+      "type": "object",
+      "required": ["path", "hash"],
+      "properties": {
+        "path": {"type": "string"},
+        "hash": {"type": "string"}
+      }
+    },
+    "workspace": {
+      "type": "object",
+      "required": ["mode", "path"],
+      "properties": {
+        "mode": {"type": "string", "enum": ["scratch", "worktree", "clone"]},
+        "path": {"type": "string"},
+        "branch": {"type": ["string", "null"]},
+        "base_ref": {"type": ["string", "null"]}
+      }
+    },
+    "budgets_used": {
+      "type": "object",
+      "properties": {
+        "wall_seconds": {"type": "number"},
+        "tool_calls": {"type": "number"},
+        "commands": {"type": "number"}
+      }
+    },
+    "changed_files": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "validation": {
+      "type": "object",
+      "required": ["status"],
+      "properties": {
+        "status": {"type": "string", "enum": ["skipped", "passed", "failed"]},
+        "details_ref": {"type": ["string", "null"]}
+      }
+    },
+    "artifacts": {
+      "type": "object",
+      "properties": {
+        "diff": {"type": "string"},
+        "handoff": {"type": "string"}
+      }
+    }
+  }
+}

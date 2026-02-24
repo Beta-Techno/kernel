@@ -1,7 +1,9 @@
-use std::fs;
+use std::fs::{self, File};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+
+use crate::work_unit::WorkspaceMode;
 
 pub struct RunPaths {
     pub root: PathBuf,
@@ -10,14 +12,22 @@ pub struct RunPaths {
     pub artifacts_dir: PathBuf,
     pub receipts_dir: PathBuf,
     pub workspace_dir: PathBuf,
+    pub events_raw: PathBuf,
+    pub events_norm: PathBuf,
+    pub repos_dir: PathBuf,
+    pub worktrees_dir: PathBuf,
 }
 
-pub fn provision(run_id: &str, workspace_mode: &str) -> Result<RunPaths> {
+pub fn provision(run_id: &str, _workspace_mode: WorkspaceMode) -> Result<RunPaths> {
     let root = default_root();
     let runs_dir = root.join("runs");
     let worktrees_dir = root.join("worktrees");
-    fs::create_dir_all(&runs_dir)?;
-    fs::create_dir_all(&worktrees_dir)?;
+    let repos_dir = root.join("repos");
+    let cache_dir = root.join("cache");
+
+    for dir in [&root, &runs_dir, &worktrees_dir, &repos_dir, &cache_dir] {
+        ensure_dir(dir)?;
+    }
 
     let run_dir = runs_dir.join(run_id);
     let logs_dir = run_dir.join("logs");
@@ -26,12 +36,15 @@ pub fn provision(run_id: &str, workspace_mode: &str) -> Result<RunPaths> {
     let workspace_dir = worktrees_dir.join(run_id);
 
     for dir in [&run_dir, &logs_dir, &artifacts_dir, &receipts_dir] {
-        fs::create_dir_all(dir).with_context(|| format!("failed to create dir {:?}", dir))?;
+        ensure_dir(dir)?;
     }
 
-    if workspace_mode == "scratch" {
-        fs::create_dir_all(&workspace_dir)?;
-    }
+    ensure_dir(&workspace_dir)?;
+
+    let events_raw = run_dir.join("events.raw.jsonl");
+    let events_norm = run_dir.join("events.norm.jsonl");
+    ensure_file(&events_raw)?;
+    ensure_file(&events_norm)?;
 
     Ok(RunPaths {
         root,
@@ -40,11 +53,45 @@ pub fn provision(run_id: &str, workspace_mode: &str) -> Result<RunPaths> {
         artifacts_dir,
         receipts_dir,
         workspace_dir,
+        events_raw,
+        events_norm,
+        repos_dir,
+        worktrees_dir,
     })
 }
 
 fn default_root() -> PathBuf {
+    if let Ok(root) = std::env::var("AGENTD_ROOT") {
+        return PathBuf::from(root);
+    }
+
+    if let Some(dir) = dirs::data_dir() {
+        return dir.join("agentd");
+    }
+
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".agentd")
+        .join("agentd")
+}
+
+fn ensure_dir(path: &PathBuf) -> Result<()> {
+    fs::create_dir_all(path).with_context(|| format!("failed to create dir {:?}", path))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = fs::Permissions::from_mode(0o700);
+        fs::set_permissions(path, perms)?;
+    }
+    Ok(())
+}
+
+fn ensure_file(path: &PathBuf) -> Result<()> {
+    File::create(path).with_context(|| format!("failed to create file {:?}", path))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = fs::Permissions::from_mode(0o600);
+        fs::set_permissions(path, perms)?;
+    }
+    Ok(())
 }

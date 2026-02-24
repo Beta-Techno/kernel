@@ -8,7 +8,7 @@
     "workspace_mode": "worktree"
   },
   "agent": {
-    "driver": "codex_exec",
+    "driver": "noop",
     "model_hint": "gpt-5-codex",
     "prompt": "Test prompt",
     "context_files": [],

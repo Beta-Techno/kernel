@@ -27,12 +27,14 @@ pub struct Target {
 }
 
 impl Target {
-    pub fn workspace_mode_str(&self) -> &'static str {
-        match self.workspace_mode {
-            WorkspaceMode::Worktree => "worktree",
-            WorkspaceMode::Clone => "clone",
-            WorkspaceMode::Scratch => "scratch",
-        }
+    pub fn branch_slug(&self, run_id: &str) -> String {
+        let slug = self
+            .subdir
+            .as_deref()
+            .unwrap_or("default")
+            .replace('/', "_")
+            .replace(' ', "-");
+        format!("runs/{}/{}", run_id, slug)
     }
 }
 
@@ -109,7 +111,7 @@ pub struct Outputs {
     pub open_pr: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Copy, Clone)]
 pub enum WorkspaceMode {
     #[serde(rename = "worktree")]
     Worktree,
@@ -117,6 +119,16 @@ pub enum WorkspaceMode {
     Clone,
     #[serde(rename = "scratch")]
     Scratch,
+}
+
+impl WorkspaceMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WorkspaceMode::Worktree => "worktree",
+            WorkspaceMode::Clone => "clone",
+            WorkspaceMode::Scratch => "scratch",
+        }
+    }
 }
 
 fn default_workspace_mode() -> WorkspaceMode {
