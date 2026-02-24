@@ -31,6 +31,25 @@ struct ValidationOutcome {
     commands_used: u64,
 }
 
+struct GitArtifacts {
+    changed_files: Vec<String>,
+    diff_lines: u64,
+    bytes_written: u64,
+}
+
+struct StatusSummary {
+    changed_files: Vec<String>,
+    untracked_files: Vec<String>,
+    tracked_count: usize,
+    untracked_count: usize,
+}
+
+#[derive(Default)]
+struct ToolEventCounts {
+    tool_calls: u64,
+    command_calls: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunStatus {
     Ok,
@@ -74,12 +93,10 @@ pub fn execute(
     let started_at = run_id::timestamp();
     let timer = Instant::now();
     let wall_budget_seconds = work_unit.budgets.wall_seconds;
-    let mut budget_exceeded = false;
+    let mut emitted_budget_events = BTreeSet::new();
     let branch = workspace_branch(work_unit, run_id);
 
-    if work_unit.agent.driver == "codex_exec" {
-        prepare_workspace(work_unit, run_id, paths)?;
-    }
+    prepare_workspace(work_unit, run_id, paths)?;
 
     events.emit(
         "workspace.created",
@@ -98,13 +115,36 @@ pub fn execute(
             events,
             &timer,
             wall_budget_seconds,
-            &mut budget_exceeded,
+            &mut emitted_budget_events,
         )?,
         other => bail!("unsupported driver: {other}"),
     };
 
     if remaining_wall_budget(&timer, wall_budget_seconds).is_none() {
-        emit_budget_exceeded_once(events, wall_budget_seconds, &mut budget_exceeded)?;
+        emit_budget_exceeded_once(
+            events,
+            "wall_seconds",
+            wall_budget_seconds,
+            &mut emitted_budget_events,
+        )?;
+        agent.status = RunStatus::Failed;
+    }
+    if enforce_budget_limit(
+        events,
+        "max_tool_calls",
+        work_unit.budgets.max_tool_calls,
+        agent.tool_calls,
+        &mut emitted_budget_events,
+    )? {
+        agent.status = RunStatus::Failed;
+    }
+    if enforce_budget_limit(
+        events,
+        "max_commands",
+        work_unit.budgets.max_commands,
+        agent.commands_used,
+        &mut emitted_budget_events,
+    )? {
         agent.status = RunStatus::Failed;
     }
 
@@ -115,7 +155,9 @@ pub fn execute(
             events,
             &timer,
             wall_budget_seconds,
-            &mut budget_exceeded,
+            agent.commands_used,
+            work_unit.budgets.max_commands,
+            &mut emitted_budget_events,
         )?
     } else {
         emit_skipped_validation(events)?;
@@ -130,8 +172,36 @@ pub fn execute(
     if validation.status == "failed" && final_status == RunStatus::Ok {
         final_status = RunStatus::Failed;
     }
+    let total_commands = agent.commands_used.saturating_add(validation.commands_used);
+    if enforce_budget_limit(
+        events,
+        "max_commands",
+        work_unit.budgets.max_commands,
+        total_commands,
+        &mut emitted_budget_events,
+    )? {
+        final_status = RunStatus::Failed;
+    }
 
-    let changed_files = write_git_artifacts(work_unit, paths, events)?;
+    let git_artifacts = write_git_artifacts(work_unit, paths, events)?;
+    if enforce_budget_limit(
+        events,
+        "max_diff_lines",
+        work_unit.budgets.max_diff_lines,
+        git_artifacts.diff_lines,
+        &mut emitted_budget_events,
+    )? {
+        final_status = RunStatus::Failed;
+    }
+    if enforce_budget_limit(
+        events,
+        "max_bytes_written",
+        work_unit.budgets.max_bytes_written,
+        git_artifacts.bytes_written,
+        &mut emitted_budget_events,
+    )? {
+        final_status = RunStatus::Failed;
+    }
     let finished_at = run_id::timestamp();
     let wall_seconds = timer.elapsed().as_secs();
     let diff_ref = "artifacts/diff.patch".to_string();
@@ -155,9 +225,9 @@ pub fn execute(
         budgets_used: BudgetsUsed {
             wall_seconds,
             tool_calls: agent.tool_calls,
-            commands: agent.commands_used + validation.commands_used,
+            commands: total_commands,
         },
-        changed_files,
+        changed_files: git_artifacts.changed_files,
         validation: Validation {
             status: validation.status.clone(),
             details_ref: validation.details_ref.clone(),
@@ -236,7 +306,7 @@ fn run_codex_exec(
     events: &mut EventWriter,
     timer: &Instant,
     wall_budget_seconds: u64,
-    budget_exceeded: &mut bool,
+    emitted_budget_events: &mut BTreeSet<&'static str>,
 ) -> Result<AgentOutcome> {
     touch_agent_logs(paths)?;
 
@@ -272,7 +342,12 @@ fn run_codex_exec(
     let remaining = match remaining_wall_budget(timer, wall_budget_seconds) {
         Some(v) => v,
         None => {
-            emit_budget_exceeded_once(events, wall_budget_seconds, budget_exceeded)?;
+            emit_budget_exceeded_once(
+                events,
+                "wall_seconds",
+                wall_budget_seconds,
+                emitted_budget_events,
+            )?;
             events.emit(
                 "agent.exited",
                 &serde_json::json!({
@@ -298,9 +373,14 @@ fn run_codex_exec(
     fs::write(paths.logs_dir.join("agent.stderr.log"), &output.stderr)?;
     fs::write(&paths.events_raw, &output.stdout)?;
 
-    let tool_calls = emit_tool_events_from_raw(&output.stdout, events)?;
+    let counts = emit_tool_events_from_raw(&output.stdout, events)?;
     let (status, reason) = if timed_out {
-        emit_budget_exceeded_once(events, wall_budget_seconds, budget_exceeded)?;
+        emit_budget_exceeded_once(
+            events,
+            "wall_seconds",
+            wall_budget_seconds,
+            emitted_budget_events,
+        )?;
         (RunStatus::Failed, "budget_exceeded")
     } else {
         status_from_exit(output.status)
@@ -315,8 +395,8 @@ fn run_codex_exec(
 
     Ok(AgentOutcome {
         status,
-        commands_used: 0,
-        tool_calls,
+        commands_used: counts.command_calls,
+        tool_calls: counts.tool_calls,
     })
 }
 
@@ -326,7 +406,9 @@ fn run_validation(
     events: &mut EventWriter,
     timer: &Instant,
     wall_budget_seconds: u64,
-    budget_exceeded: &mut bool,
+    already_used_commands: u64,
+    max_commands_budget: Option<u64>,
+    emitted_budget_events: &mut BTreeSet<&'static str>,
 ) -> Result<ValidationOutcome> {
     let commands = work_unit.acceptance.commands.clone();
     events.emit(
@@ -361,10 +443,22 @@ fn run_validation(
     let mut commands_used = 0_u64;
 
     for (idx, command_text) in work_unit.acceptance.commands.iter().enumerate() {
+        let total_before = already_used_commands.saturating_add(commands_used);
+        if let Some(limit) = command_budget_exhausted(max_commands_budget, total_before) {
+            emit_budget_exceeded_once(events, "max_commands", limit, emitted_budget_events)?;
+            all_passed = false;
+            break;
+        }
+
         let remaining = match remaining_wall_budget(timer, wall_budget_seconds) {
             Some(v) => v,
             None => {
-                emit_budget_exceeded_once(events, wall_budget_seconds, budget_exceeded)?;
+                emit_budget_exceeded_once(
+                    events,
+                    "wall_seconds",
+                    wall_budget_seconds,
+                    emitted_budget_events,
+                )?;
                 all_passed = false;
                 break;
             }
@@ -392,7 +486,12 @@ fn run_validation(
         append_bytes(&stderr_path, &output.stderr)?;
 
         let exit_code = if timed_out {
-            emit_budget_exceeded_once(events, wall_budget_seconds, budget_exceeded)?;
+            emit_budget_exceeded_once(
+                events,
+                "wall_seconds",
+                wall_budget_seconds,
+                emitted_budget_events,
+            )?;
             -1
         } else {
             output.status.code().unwrap_or(-1)
@@ -450,15 +549,20 @@ fn write_git_artifacts(
     work_unit: &WorkUnit,
     paths: &RunPaths,
     events: &mut EventWriter,
-) -> Result<Vec<String>> {
+) -> Result<GitArtifacts> {
     let diff_path = paths.artifacts_dir.join("diff.patch");
     let changed_files_path = paths.artifacts_dir.join("changed_files.json");
 
-    if work_unit.target.workspace_mode == WorkspaceMode::Scratch || !is_git_repo_root(&paths.workspace_dir)
+    if work_unit.target.workspace_mode == WorkspaceMode::Scratch
+        || !is_git_repo_root(&paths.workspace_dir)
     {
         fs::write(diff_path, [])?;
         fs::write(changed_files_path, b"[]\n")?;
-        return Ok(vec![]);
+        return Ok(GitArtifacts {
+            changed_files: vec![],
+            diff_lines: 0,
+            bytes_written: 0,
+        });
     }
 
     let diff = git_capture(&paths.workspace_dir, ["diff", "--binary"])
@@ -466,40 +570,42 @@ fn write_git_artifacts(
     fs::write(&diff_path, &diff.stdout)?;
 
     let status = git_capture(&paths.workspace_dir, ["status", "--porcelain"])?;
-    let changed_files = parse_status_paths(&status.stdout);
-    let status_lines = String::from_utf8_lossy(&status.stdout);
-    let tracked = status_lines
-        .lines()
-        .filter(|line| !line.starts_with("??"))
-        .count();
-    let untracked = status_lines
-        .lines()
-        .filter(|line| line.starts_with("??"))
-        .count();
+    let summary = parse_status_summary(&status.stdout);
     events.emit(
         "git.status",
         &serde_json::json!({
-            "clean": changed_files.is_empty(),
-            "tracked": tracked,
-            "untracked": untracked,
+            "clean": summary.changed_files.is_empty(),
+            "tracked": summary.tracked_count,
+            "untracked": summary.untracked_count,
         }),
     )?;
 
     let numstat = git_capture(&paths.workspace_dir, ["diff", "--numstat"])?;
     let (files, insertions, deletions) = parse_numstat(&numstat.stdout);
+    let untracked_lines = sum_file_lines(&paths.workspace_dir, &summary.untracked_files);
+    let diff_lines = insertions
+        .saturating_add(deletions)
+        .saturating_add(untracked_lines);
+    let bytes_written =
+        emit_file_write_events(&paths.workspace_dir, &summary.changed_files, events)?;
     events.emit(
         "git.diff.stats",
         &serde_json::json!({
-            "files": files,
+            "files": std::cmp::max(files, summary.changed_files.len()),
             "insertions": insertions,
             "deletions": deletions,
+            "diff_lines": diff_lines,
         }),
     )?;
 
-    let json = serde_json::to_vec_pretty(&changed_files)?;
+    let json = serde_json::to_vec_pretty(&summary.changed_files)?;
     fs::write(changed_files_path, json)?;
 
-    Ok(changed_files)
+    Ok(GitArtifacts {
+        changed_files: summary.changed_files,
+        diff_lines,
+        bytes_written,
+    })
 }
 
 fn prepare_workspace(work_unit: &WorkUnit, run_id: &str, paths: &RunPaths) -> Result<()> {
@@ -681,25 +787,53 @@ fn remaining_wall_budget(started: &Instant, limit_seconds: u64) -> Option<Durati
 
 fn emit_budget_exceeded_once(
     events: &mut EventWriter,
-    wall_budget_seconds: u64,
-    emitted: &mut bool,
+    budget: &'static str,
+    limit: u64,
+    emitted: &mut BTreeSet<&'static str>,
 ) -> Result<()> {
-    if *emitted {
+    if !emitted.insert(budget) {
         return Ok(());
     }
-    *emitted = true;
     events.emit(
         "budget.exceeded",
         &serde_json::json!({
-            "budget": "wall_seconds",
-            "limit": wall_budget_seconds,
+            "budget": budget,
+            "limit": limit,
         }),
     )
 }
 
-fn emit_tool_events_from_raw(raw_jsonl: &[u8], events: &mut EventWriter) -> Result<u64> {
+fn enforce_budget_limit(
+    events: &mut EventWriter,
+    budget: &'static str,
+    limit: Option<u64>,
+    used: u64,
+    emitted: &mut BTreeSet<&'static str>,
+) -> Result<bool> {
+    let Some(limit) = limit else {
+        return Ok(false);
+    };
+    if used <= limit {
+        return Ok(false);
+    }
+    emit_budget_exceeded_once(events, budget, limit, emitted)?;
+    Ok(true)
+}
+
+fn command_budget_exhausted(limit: Option<u64>, used: u64) -> Option<u64> {
+    let limit = limit?;
+    if used >= limit {
+        return Some(limit);
+    }
+    None
+}
+
+fn emit_tool_events_from_raw(
+    raw_jsonl: &[u8],
+    events: &mut EventWriter,
+) -> Result<ToolEventCounts> {
     let text = String::from_utf8_lossy(raw_jsonl);
-    let mut calls = 0_u64;
+    let mut counts = ToolEventCounts::default();
 
     for line in text.lines() {
         let parsed: Value = match serde_json::from_str(line) {
@@ -709,7 +843,10 @@ fn emit_tool_events_from_raw(raw_jsonl: &[u8], events: &mut EventWriter) -> Resu
         if let Some(tool_event) = classify_tool_event(&parsed) {
             match tool_event {
                 ParsedToolEvent::Call { tool, args_hash } => {
-                    calls += 1;
+                    counts.tool_calls += 1;
+                    if is_command_tool_name(&tool) {
+                        counts.command_calls += 1;
+                    }
                     events.emit(
                         "tool.call",
                         &serde_json::json!({
@@ -737,7 +874,7 @@ fn emit_tool_events_from_raw(raw_jsonl: &[u8], events: &mut EventWriter) -> Resu
         }
     }
 
-    Ok(calls)
+    Ok(counts)
 }
 
 enum ParsedToolEvent {
@@ -847,6 +984,40 @@ fn hash_json_value(value: Option<&Value>) -> String {
     hex::encode(hasher.finalize())
 }
 
+fn is_command_tool_name(tool: &str) -> bool {
+    let lower = tool.to_ascii_lowercase();
+    lower == "exec_command"
+        || lower.ends_with(".exec_command")
+        || lower.contains("exec_command")
+        || lower == "shell.exec"
+}
+
+fn emit_file_write_events(
+    workspace_dir: &Path,
+    changed_files: &[String],
+    events: &mut EventWriter,
+) -> Result<u64> {
+    let mut total = 0_u64;
+
+    for rel_path in changed_files {
+        let path = workspace_dir.join(rel_path);
+        let bytes = match fs::metadata(&path) {
+            Ok(meta) if meta.is_file() => meta.len(),
+            _ => 0,
+        };
+        total = total.saturating_add(bytes);
+        events.emit(
+            "file.write",
+            &serde_json::json!({
+                "path": rel_path,
+                "bytes": bytes,
+            }),
+        )?;
+    }
+
+    Ok(total)
+}
+
 fn is_git_repo_root(dir: &Path) -> bool {
     dir.join(".git").exists()
 }
@@ -921,24 +1092,39 @@ fn shell_preview(command: &str) -> Vec<String> {
     }
 }
 
-fn parse_status_paths(status_output: &[u8]) -> Vec<String> {
+fn parse_status_summary(status_output: &[u8]) -> StatusSummary {
     let text = String::from_utf8_lossy(status_output);
-    let mut paths = BTreeSet::new();
+    let mut changed_paths = BTreeSet::new();
+    let mut untracked_paths = BTreeSet::new();
+    let mut tracked_count = 0_usize;
+    let mut untracked_count = 0_usize;
 
     for line in text.lines() {
         if line.len() < 4 {
             continue;
         }
+        let is_untracked = line.starts_with("??");
         let mut path = line[3..].trim().to_string();
         if let Some((_, renamed_to)) = path.rsplit_once(" -> ") {
             path = renamed_to.to_string();
         }
         if !path.is_empty() {
-            paths.insert(path);
+            if is_untracked {
+                untracked_paths.insert(path.clone());
+                untracked_count += 1;
+            } else {
+                tracked_count += 1;
+            }
+            changed_paths.insert(path);
         }
     }
 
-    paths.into_iter().collect()
+    StatusSummary {
+        changed_files: changed_paths.into_iter().collect(),
+        untracked_files: untracked_paths.into_iter().collect(),
+        tracked_count,
+        untracked_count,
+    }
 }
 
 fn parse_numstat(numstat_output: &[u8]) -> (usize, u64, u64) {
@@ -966,6 +1152,14 @@ fn parse_numstat(numstat_output: &[u8]) -> (usize, u64, u64) {
     (files, insertions, deletions)
 }
 
+fn sum_file_lines(workspace_dir: &Path, rel_paths: &[String]) -> u64 {
+    rel_paths
+        .iter()
+        .filter_map(|rel| fs::read(workspace_dir.join(rel)).ok())
+        .map(|content| String::from_utf8_lossy(&content).lines().count() as u64)
+        .fold(0_u64, u64::saturating_add)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -973,8 +1167,24 @@ mod tests {
     #[test]
     fn parses_status_paths_with_rename_and_untracked() {
         let status = b" M src/main.rs\nR  old.txt -> new.txt\n?? notes.md\n";
-        let paths = parse_status_paths(status);
-        assert_eq!(paths, vec!["new.txt", "notes.md", "src/main.rs"]);
+        let summary = parse_status_summary(status);
+        assert_eq!(
+            summary.changed_files,
+            vec!["new.txt", "notes.md", "src/main.rs"]
+        );
+    }
+
+    #[test]
+    fn parses_status_summary_counts() {
+        let status = b" M src/main.rs\nR  old.txt -> new.txt\n?? notes.md\n";
+        let summary = parse_status_summary(status);
+        assert_eq!(
+            summary.changed_files,
+            vec!["new.txt", "notes.md", "src/main.rs"]
+        );
+        assert_eq!(summary.untracked_files, vec!["notes.md"]);
+        assert_eq!(summary.tracked_count, 2);
+        assert_eq!(summary.untracked_count, 1);
     }
 
     #[test]
@@ -1034,9 +1244,39 @@ mod tests {
     }
 
     #[test]
+    fn command_tool_name_detection_is_specific() {
+        assert!(is_command_tool_name("exec_command"));
+        assert!(is_command_tool_name("foo.exec_command"));
+        assert!(!is_command_tool_name("github.search"));
+    }
+
+    #[test]
     fn remaining_budget_none_when_elapsed_exceeds_limit() {
         let started = Instant::now() - Duration::from_secs(2);
         assert!(remaining_wall_budget(&started, 1).is_none());
+    }
+
+    #[test]
+    fn command_budget_exhausted_blocks_at_limit() {
+        assert_eq!(command_budget_exhausted(Some(0), 0), Some(0));
+        assert_eq!(command_budget_exhausted(Some(1), 1), Some(1));
+        assert_eq!(command_budget_exhausted(Some(2), 1), None);
+        assert_eq!(command_budget_exhausted(None, 100), None);
+    }
+
+    #[test]
+    fn tool_events_count_command_calls() {
+        let raw = br#"{"type":"item.completed","item":{"type":"tool_call","tool":"exec_command","arguments":{"cmd":"echo hi"}}}
+{"type":"item.completed","item":{"type":"tool_call","tool":"github.search","arguments":{"q":"x"}}}
+"#;
+        let dir = std::env::temp_dir().join(format!("agentctl-tests-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let events_path = dir.join("events.norm.jsonl");
+        let mut events =
+            EventWriter::new("run-test".to_string(), events_path).expect("event writer");
+        let counts = emit_tool_events_from_raw(raw, &mut events).expect("parse raw events");
+        assert_eq!(counts.tool_calls, 2);
+        assert_eq!(counts.command_calls, 1);
     }
 
     #[cfg(unix)]
