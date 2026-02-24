@@ -202,6 +202,19 @@ pub fn execute(
     )? {
         final_status = RunStatus::Failed;
     }
+    if receipts_are_required(work_unit) {
+        let receipt_count = count_receipt_files(&paths.receipts_dir)?;
+        if receipt_count == 0 {
+            events.emit(
+                "policy.denied",
+                &serde_json::json!({
+                    "capability": "receipts.required",
+                    "reason": "missing_receipts",
+                }),
+            )?;
+            final_status = RunStatus::Failed;
+        }
+    }
     let finished_at = run_id::timestamp();
     let wall_seconds = timer.elapsed().as_secs();
     let diff_ref = "artifacts/diff.patch".to_string();
@@ -1160,6 +1173,32 @@ fn sum_file_lines(workspace_dir: &Path, rel_paths: &[String]) -> u64 {
         .fold(0_u64, u64::saturating_add)
 }
 
+fn receipts_are_required(work_unit: &WorkUnit) -> bool {
+    work_unit.kind == "ops" || work_unit.acceptance.receipts_required
+}
+
+fn count_receipt_files(receipts_dir: &Path) -> Result<u64> {
+    let mut count = 0_u64;
+    let mut stack = vec![receipts_dir.to_path_buf()];
+
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir)
+            .with_context(|| format!("failed to read receipts dir {}", dir.display()))?
+        {
+            let entry = entry?;
+            let path = entry.path();
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                stack.push(path);
+            } else if file_type.is_file() {
+                count = count.saturating_add(1);
+            }
+        }
+    }
+
+    Ok(count)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1262,6 +1301,17 @@ mod tests {
         assert_eq!(command_budget_exhausted(Some(1), 1), Some(1));
         assert_eq!(command_budget_exhausted(Some(2), 1), None);
         assert_eq!(command_budget_exhausted(None, 100), None);
+    }
+
+    #[test]
+    fn counts_receipts_recursively() {
+        let root = std::env::temp_dir().join(format!("agentctl-receipts-{}", uuid::Uuid::new_v4()));
+        let nested = root.join("github");
+        fs::create_dir_all(&nested).expect("create nested receipt dir");
+        fs::write(root.join("one.json"), b"{}").expect("write receipt");
+        fs::write(nested.join("two.json"), b"{}").expect("write nested receipt");
+        let count = count_receipt_files(&root).expect("count receipts");
+        assert_eq!(count, 2);
     }
 
     #[test]
