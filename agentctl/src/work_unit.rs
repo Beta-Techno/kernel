@@ -111,7 +111,7 @@ pub struct Outputs {
     pub open_pr: bool,
 }
 
-#[derive(Debug, Deserialize, Copy, Clone)]
+#[derive(Debug, Deserialize, Copy, Clone, PartialEq, Eq)]
 pub enum WorkspaceMode {
     #[serde(rename = "worktree")]
     Worktree,
