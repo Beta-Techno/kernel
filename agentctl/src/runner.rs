@@ -3,9 +3,11 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Output, Stdio};
-use std::time::Instant;
+use std::thread::sleep;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use serde_json::Value;
 
 use crate::artifacts::{self, ArtifactRefs, BudgetsUsed, RunRecord, Spec, Validation, Workspace};
 use crate::events::EventWriter;
@@ -20,6 +22,7 @@ pub struct DriverResult {
 struct AgentOutcome {
     status: RunStatus,
     commands_used: u64,
+    tool_calls: u64,
 }
 
 struct ValidationOutcome {
@@ -70,6 +73,8 @@ pub fn execute(
 ) -> Result<DriverResult> {
     let started_at = run_id::timestamp();
     let timer = Instant::now();
+    let wall_budget_seconds = work_unit.budgets.wall_seconds;
+    let mut budget_exceeded = false;
     let branch = workspace_branch(work_unit, run_id);
 
     if work_unit.agent.driver == "codex_exec" {
@@ -85,14 +90,33 @@ pub fn execute(
         }),
     )?;
 
-    let agent = match work_unit.agent.driver.as_str() {
+    let mut agent = match work_unit.agent.driver.as_str() {
         "noop" => run_noop(work_unit, paths, events)?,
-        "codex_exec" => run_codex_exec(work_unit, paths, events)?,
+        "codex_exec" => run_codex_exec(
+            work_unit,
+            paths,
+            events,
+            &timer,
+            wall_budget_seconds,
+            &mut budget_exceeded,
+        )?,
         other => bail!("unsupported driver: {other}"),
     };
 
+    if remaining_wall_budget(&timer, wall_budget_seconds).is_none() {
+        emit_budget_exceeded_once(events, wall_budget_seconds, &mut budget_exceeded)?;
+        agent.status = RunStatus::Failed;
+    }
+
     let validation = if agent.status == RunStatus::Ok {
-        run_validation(work_unit, paths, events)?
+        run_validation(
+            work_unit,
+            paths,
+            events,
+            &timer,
+            wall_budget_seconds,
+            &mut budget_exceeded,
+        )?
     } else {
         emit_skipped_validation(events)?;
         ValidationOutcome {
@@ -101,6 +125,11 @@ pub fn execute(
             commands_used: 0,
         }
     };
+
+    let mut final_status = agent.status;
+    if validation.status == "failed" && final_status == RunStatus::Ok {
+        final_status = RunStatus::Failed;
+    }
 
     let changed_files = write_git_artifacts(work_unit, paths, events)?;
     let finished_at = run_id::timestamp();
@@ -112,7 +141,7 @@ pub fn execute(
         run_id: run_id.to_string(),
         version: "runfmt/0.1",
         kind: work_unit.kind.clone(),
-        status: agent.status.as_run_record_status().to_string(),
+        status: final_status.as_run_record_status().to_string(),
         driver: work_unit.agent.driver.clone(),
         started_at,
         finished_at,
@@ -125,7 +154,7 @@ pub fn execute(
         },
         budgets_used: BudgetsUsed {
             wall_seconds,
-            tool_calls: 0,
+            tool_calls: agent.tool_calls,
             commands: agent.commands_used + validation.commands_used,
         },
         changed_files,
@@ -151,13 +180,13 @@ pub fn execute(
     events.emit(
         "run.finished",
         &serde_json::json!({
-            "status": agent.status.as_run_finished_status(),
+            "status": final_status.as_run_finished_status(),
             "summary_ref": "RUN.json",
         }),
     )?;
 
     Ok(DriverResult {
-        status: agent.status,
+        status: final_status,
     })
 }
 
@@ -190,12 +219,14 @@ fn run_noop(
         return Ok(AgentOutcome {
             status: RunStatus::Ok,
             commands_used: 0,
+            tool_calls: 0,
         });
     }
 
     Ok(AgentOutcome {
         status: RunStatus::Ok,
         commands_used: 0,
+        tool_calls: 0,
     })
 }
 
@@ -203,6 +234,9 @@ fn run_codex_exec(
     work_unit: &WorkUnit,
     paths: &RunPaths,
     events: &mut EventWriter,
+    timer: &Instant,
+    wall_budget_seconds: u64,
+    budget_exceeded: &mut bool,
 ) -> Result<AgentOutcome> {
     touch_agent_logs(paths)?;
 
@@ -215,7 +249,7 @@ fn run_codex_exec(
     let mut cmd = Command::new("codex");
     cmd.arg("exec").arg("--json").arg("--cd").arg(&command_dir);
 
-    if !is_git_repo(&command_dir) {
+    if !is_git_context(&command_dir, &paths.workspace_dir) {
         cmd.arg("--skip-git-repo-check");
     }
 
@@ -235,19 +269,46 @@ fn run_codex_exec(
         }),
     )?;
 
-    let output = cmd
-        .output()
-        .context("failed to spawn codex exec; ensure codex CLI is installed and in PATH")?;
+    let remaining = match remaining_wall_budget(timer, wall_budget_seconds) {
+        Some(v) => v,
+        None => {
+            emit_budget_exceeded_once(events, wall_budget_seconds, budget_exceeded)?;
+            events.emit(
+                "agent.exited",
+                &serde_json::json!({
+                    "exit_code": -1,
+                    "reason": "budget_exceeded",
+                }),
+            )?;
+            return Ok(AgentOutcome {
+                status: RunStatus::Failed,
+                commands_used: 0,
+                tool_calls: 0,
+            });
+        }
+    };
+
+    let (output, timed_out) = run_command_with_timeout(
+        &mut cmd,
+        remaining,
+        "failed to spawn codex exec; ensure codex CLI is installed and in PATH",
+    )?;
 
     fs::write(paths.logs_dir.join("agent.stdout.log"), &output.stdout)?;
     fs::write(paths.logs_dir.join("agent.stderr.log"), &output.stderr)?;
     fs::write(&paths.events_raw, &output.stdout)?;
 
-    let (status, reason) = status_from_exit(output.status);
+    let tool_calls = emit_tool_events_from_raw(&output.stdout, events)?;
+    let (status, reason) = if timed_out {
+        emit_budget_exceeded_once(events, wall_budget_seconds, budget_exceeded)?;
+        (RunStatus::Failed, "budget_exceeded")
+    } else {
+        status_from_exit(output.status)
+    };
     events.emit(
         "agent.exited",
         &serde_json::json!({
-            "exit_code": output.status.code().unwrap_or(-1),
+            "exit_code": if timed_out { -1 } else { output.status.code().unwrap_or(-1) },
             "reason": reason,
         }),
     )?;
@@ -255,6 +316,7 @@ fn run_codex_exec(
     Ok(AgentOutcome {
         status,
         commands_used: 0,
+        tool_calls,
     })
 }
 
@@ -262,6 +324,9 @@ fn run_validation(
     work_unit: &WorkUnit,
     paths: &RunPaths,
     events: &mut EventWriter,
+    timer: &Instant,
+    wall_budget_seconds: u64,
+    budget_exceeded: &mut bool,
 ) -> Result<ValidationOutcome> {
     let commands = work_unit.acceptance.commands.clone();
     events.emit(
@@ -296,6 +361,15 @@ fn run_validation(
     let mut commands_used = 0_u64;
 
     for (idx, command_text) in work_unit.acceptance.commands.iter().enumerate() {
+        let remaining = match remaining_wall_budget(timer, wall_budget_seconds) {
+            Some(v) => v,
+            None => {
+                emit_budget_exceeded_once(events, wall_budget_seconds, budget_exceeded)?;
+                all_passed = false;
+                break;
+            }
+        };
+
         let command_id = format!("cmd-{:02}", idx + 1);
         events.emit(
             "command.exec",
@@ -306,15 +380,23 @@ fn run_validation(
             }),
         )?;
 
-        let output = shell_command(command_text, &command_dir)
-            .output()
-            .with_context(|| format!("failed running acceptance command: {command_text}"))?;
+        let mut command = shell_command(command_text, &command_dir);
+        let (output, timed_out) = run_command_with_timeout(
+            &mut command,
+            remaining,
+            &format!("failed running acceptance command: {command_text}"),
+        )?;
         commands_used += 1;
 
         append_bytes(&stdout_path, &output.stdout)?;
         append_bytes(&stderr_path, &output.stderr)?;
 
-        let exit_code = output.status.code().unwrap_or(-1);
+        let exit_code = if timed_out {
+            emit_budget_exceeded_once(events, wall_budget_seconds, budget_exceeded)?;
+            -1
+        } else {
+            output.status.code().unwrap_or(-1)
+        };
         events.emit(
             "command.result",
             &serde_json::json!({
@@ -325,7 +407,7 @@ fn run_validation(
             }),
         )?;
 
-        if !output.status.success() {
+        if timed_out || !output.status.success() {
             all_passed = false;
             break;
         }
@@ -372,8 +454,7 @@ fn write_git_artifacts(
     let diff_path = paths.artifacts_dir.join("diff.patch");
     let changed_files_path = paths.artifacts_dir.join("changed_files.json");
 
-    if work_unit.target.workspace_mode == WorkspaceMode::Scratch
-        || !is_git_repo(&paths.workspace_dir)
+    if work_unit.target.workspace_mode == WorkspaceMode::Scratch || !is_git_repo_root(&paths.workspace_dir)
     {
         fs::write(diff_path, [])?;
         fs::write(changed_files_path, b"[]\n")?;
@@ -565,8 +646,213 @@ fn status_from_exit(status: ExitStatus) -> (RunStatus, &'static str) {
     }
 }
 
-fn is_git_repo(dir: &Path) -> bool {
+fn run_command_with_timeout(
+    command: &mut Command,
+    timeout: Duration,
+    spawn_error_context: &str,
+) -> Result<(Output, bool)> {
+    let mut child = command
+        .spawn()
+        .with_context(|| spawn_error_context.to_string())?;
+    let started = Instant::now();
+
+    loop {
+        if child.try_wait()?.is_some() {
+            let output = child.wait_with_output()?;
+            return Ok((output, false));
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let output = child.wait_with_output()?;
+            return Ok((output, true));
+        }
+        sleep(Duration::from_millis(100));
+    }
+}
+
+fn remaining_wall_budget(started: &Instant, limit_seconds: u64) -> Option<Duration> {
+    let elapsed = started.elapsed();
+    let limit = Duration::from_secs(limit_seconds);
+    if elapsed >= limit {
+        return None;
+    }
+    Some(limit - elapsed)
+}
+
+fn emit_budget_exceeded_once(
+    events: &mut EventWriter,
+    wall_budget_seconds: u64,
+    emitted: &mut bool,
+) -> Result<()> {
+    if *emitted {
+        return Ok(());
+    }
+    *emitted = true;
+    events.emit(
+        "budget.exceeded",
+        &serde_json::json!({
+            "budget": "wall_seconds",
+            "limit": wall_budget_seconds,
+        }),
+    )
+}
+
+fn emit_tool_events_from_raw(raw_jsonl: &[u8], events: &mut EventWriter) -> Result<u64> {
+    let text = String::from_utf8_lossy(raw_jsonl);
+    let mut calls = 0_u64;
+
+    for line in text.lines() {
+        let parsed: Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if let Some(tool_event) = classify_tool_event(&parsed) {
+            match tool_event {
+                ParsedToolEvent::Call { tool, args_hash } => {
+                    calls += 1;
+                    events.emit(
+                        "tool.call",
+                        &serde_json::json!({
+                            "tool": tool,
+                            "args_hash": args_hash,
+                            "capability": null,
+                        }),
+                    )?;
+                }
+                ParsedToolEvent::Result {
+                    tool,
+                    status,
+                    receipt_ref,
+                } => {
+                    events.emit(
+                        "tool.result",
+                        &serde_json::json!({
+                            "tool": tool,
+                            "status": status,
+                            "receipt_ref": receipt_ref,
+                        }),
+                    )?;
+                }
+            }
+        }
+    }
+
+    Ok(calls)
+}
+
+enum ParsedToolEvent {
+    Call {
+        tool: String,
+        args_hash: String,
+    },
+    Result {
+        tool: String,
+        status: String,
+        receipt_ref: Option<String>,
+    },
+}
+
+fn classify_tool_event(value: &Value) -> Option<ParsedToolEvent> {
+    let top_type = value.get("type")?.as_str()?;
+
+    if top_type == "item.completed" {
+        let item = value.get("item")?;
+        return classify_tool_item(item);
+    }
+
+    if top_type.contains("tool_call") || top_type.contains("mcp_tool") {
+        let tool = tool_name(value);
+        let args_hash = hash_json_value(
+            value
+                .get("arguments")
+                .or_else(|| value.get("args"))
+                .or_else(|| value.get("input")),
+        );
+
+        if top_type.contains("fail") {
+            return Some(ParsedToolEvent::Result {
+                tool,
+                status: "error".to_string(),
+                receipt_ref: None,
+            });
+        }
+        if top_type.contains("complete") || top_type.contains("result") {
+            return Some(ParsedToolEvent::Result {
+                tool,
+                status: "ok".to_string(),
+                receipt_ref: None,
+            });
+        }
+        if top_type.contains("start") || top_type.contains("call") {
+            return Some(ParsedToolEvent::Call { tool, args_hash });
+        }
+    }
+
+    None
+}
+
+fn classify_tool_item(item: &Value) -> Option<ParsedToolEvent> {
+    let item_type = item.get("type")?.as_str()?;
+    let tool = tool_name(item);
+
+    if matches!(
+        item_type,
+        "tool_call" | "mcp_tool_call" | "function_call" | "tool_use"
+    ) {
+        return Some(ParsedToolEvent::Call {
+            tool,
+            args_hash: hash_json_value(
+                item.get("arguments")
+                    .or_else(|| item.get("args"))
+                    .or_else(|| item.get("input")),
+            ),
+        });
+    }
+
+    if matches!(
+        item_type,
+        "tool_result" | "mcp_tool_result" | "function_result"
+    ) {
+        let status = item
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("ok")
+            .to_string();
+        return Some(ParsedToolEvent::Result {
+            tool,
+            status,
+            receipt_ref: None,
+        });
+    }
+
+    None
+}
+
+fn tool_name(value: &Value) -> String {
+    value
+        .get("tool")
+        .or_else(|| value.get("name"))
+        .or_else(|| value.get("tool_name"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown_tool")
+        .to_string()
+}
+
+fn hash_json_value(value: Option<&Value>) -> String {
+    use sha2::{Digest, Sha256};
+    let data = value.cloned().unwrap_or(Value::Null);
+    let encoded = serde_json::to_vec(&data).unwrap_or_else(|_| b"null".to_vec());
+    let mut hasher = Sha256::new();
+    hasher.update(encoded);
+    hex::encode(hasher.finalize())
+}
+
+fn is_git_repo_root(dir: &Path) -> bool {
     dir.join(".git").exists()
+}
+
+fn is_git_context(command_dir: &Path, workspace_root: &Path) -> bool {
+    command_dir.starts_with(workspace_root) && is_git_repo_root(workspace_root)
 }
 
 fn git_ok<const N: usize>(dir: &Path, args: [&str; N]) -> Result<()> {
@@ -678,4 +964,88 @@ fn parse_numstat(numstat_output: &[u8]) -> (usize, u64, u64) {
     }
 
     (files, insertions, deletions)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_status_paths_with_rename_and_untracked() {
+        let status = b" M src/main.rs\nR  old.txt -> new.txt\n?? notes.md\n";
+        let paths = parse_status_paths(status);
+        assert_eq!(paths, vec!["new.txt", "notes.md", "src/main.rs"]);
+    }
+
+    #[test]
+    fn parses_numstat_totals() {
+        let numstat = b"10\t2\tsrc/main.rs\n3\t0\tREADME.md\n";
+        let (files, insertions, deletions) = parse_numstat(numstat);
+        assert_eq!(files, 2);
+        assert_eq!(insertions, 13);
+        assert_eq!(deletions, 2);
+    }
+
+    #[test]
+    fn classifies_item_tool_call_and_result() {
+        let call: Value = serde_json::json!({
+            "type": "item.completed",
+            "item": {
+                "type": "tool_call",
+                "tool": "github.search",
+                "arguments": {"q":"abc"}
+            }
+        });
+        let result: Value = serde_json::json!({
+            "type": "item.completed",
+            "item": {
+                "type": "tool_result",
+                "tool": "github.search",
+                "status": "ok"
+            }
+        });
+        match classify_tool_event(&call) {
+            Some(ParsedToolEvent::Call { tool, .. }) => assert_eq!(tool, "github.search"),
+            _ => panic!("expected tool call"),
+        }
+        match classify_tool_event(&result) {
+            Some(ParsedToolEvent::Result { tool, status, .. }) => {
+                assert_eq!(tool, "github.search");
+                assert_eq!(status, "ok");
+            }
+            _ => panic!("expected tool result"),
+        }
+    }
+
+    #[test]
+    fn classifies_completed_top_level_tool_call_as_result() {
+        let event: Value = serde_json::json!({
+            "type": "mcp_tool_call.completed",
+            "tool": "netbox.get",
+            "args": {"id": 1}
+        });
+        match classify_tool_event(&event) {
+            Some(ParsedToolEvent::Result { tool, status, .. }) => {
+                assert_eq!(tool, "netbox.get");
+                assert_eq!(status, "ok");
+            }
+            _ => panic!("expected tool result"),
+        }
+    }
+
+    #[test]
+    fn remaining_budget_none_when_elapsed_exceeds_limit() {
+        let started = Instant::now() - Duration::from_secs(2);
+        assert!(remaining_wall_budget(&started, 1).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn times_out_command() {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-lc").arg("sleep 1");
+        let (_, timed_out) = run_command_with_timeout(&mut cmd, Duration::from_millis(50), "spawn")
+            .expect("command should run");
+        assert!(timed_out);
+    }
 }
