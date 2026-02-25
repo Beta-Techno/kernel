@@ -20,3 +20,29 @@ Core commands:
 - `cargo run -- list --limit 20`
 - `cargo run -- show <run_id>`
 - `cargo run -- rerun <run_id>`
+
+Bundled specs:
+
+- `agentctl/runfmt-example.json` — deterministic schema/offline example (`workspace_mode: scratch`, `driver: noop`).
+- `agentctl/smoke-worktree.json` — runnable local worktree smoke spec against current repo (`target.repo: "."`).
+
+Smoke run:
+
+- `AGENTD_ROOT=/tmp/agentd-smoke cargo run -- run --spec agentctl/smoke-worktree.json`
+
+## Copying context to clipboard
+
+Use `scripts/copy_context.sh` to copy a formatted repo context snapshot to clipboard.
+
+Examples:
+
+- Full tracked context:
+  - `scripts/copy_context.sh`
+- Only changed files:
+  - `scripts/copy_context.sh --changed`
+- Include untracked files too:
+  - `scripts/copy_context.sh --include-untracked`
+- Restrict to a subtree:
+  - `scripts/copy_context.sh --path agentctl/src`
+- Print to stdout instead of clipboard:
+  - `scripts/copy_context.sh --stdout`
