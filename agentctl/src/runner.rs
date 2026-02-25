@@ -13,7 +13,7 @@ use crate::artifacts::{self, ArtifactRefs, BudgetsUsed, RunRecord, Spec, Validat
 use crate::events::EventWriter;
 use crate::run_dir::RunPaths;
 use crate::run_id;
-use crate::work_unit::{WorkUnit, WorkspaceMode};
+use crate::work_unit::{CommandPolicy, WorkUnit, WorkspaceMode};
 
 pub struct DriverResult {
     pub status: RunStatus,
@@ -23,6 +23,8 @@ struct AgentOutcome {
     status: RunStatus,
     commands_used: u64,
     tool_calls: u64,
+    session_id: Option<String>,
+    final_message_ref: Option<String>,
 }
 
 struct ValidationOutcome {
@@ -48,6 +50,7 @@ struct StatusSummary {
 struct ToolEventCounts {
     tool_calls: u64,
     command_calls: u64,
+    session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -230,6 +233,7 @@ pub fn execute(
         kind: work_unit.kind.clone(),
         status: final_status.as_run_record_status().to_string(),
         driver: work_unit.agent.driver.clone(),
+        agent_session_id: agent.session_id.clone(),
         started_at,
         finished_at,
         spec: spec.clone(),
@@ -252,13 +256,20 @@ pub fn execute(
         artifacts: ArtifactRefs {
             diff: diff_ref,
             handoff: handoff_ref.clone(),
+            agent_final: agent.final_message_ref.clone(),
         },
     };
 
     artifacts::write_run_json(&paths.run_dir.join("RUN.json"), &record)?;
     let handoff_path = paths.run_dir.join(&handoff_ref);
     if work_unit.outputs.want_handoff {
-        artifacts::write_handoff(&handoff_path, run_id, work_unit, record.status.as_str())?;
+        artifacts::write_handoff(
+            &handoff_path,
+            run_id,
+            &work_unit.target.repo,
+            record.workspace.branch.as_deref(),
+            record.status.as_str(),
+        )?;
     } else {
         events.emit(
             "artifact.skipped",
@@ -314,6 +325,8 @@ fn run_noop(
             status: RunStatus::Ok,
             commands_used: 0,
             tool_calls: 0,
+            session_id: None,
+            final_message_ref: None,
         });
     }
 
@@ -321,6 +334,8 @@ fn run_noop(
         status: RunStatus::Ok,
         commands_used: 0,
         tool_calls: 0,
+        session_id: None,
+        final_message_ref: None,
     })
 }
 
@@ -341,7 +356,16 @@ fn run_codex_exec(
         )
     })?;
     let mut cmd = Command::new("codex");
-    cmd.arg("exec").arg("--json").arg("--cd").arg(&command_dir);
+    cmd.arg("exec");
+    if let Some(session_id) = &work_unit.agent.resume_session_id {
+        cmd.arg("resume").arg(session_id);
+    }
+    cmd.arg("--ask-for-approval").arg("never");
+    cmd.arg("--sandbox").arg(codex_sandbox(work_unit));
+    cmd.arg("--json").arg("--cd").arg(&command_dir);
+    let final_message_path = paths.artifacts_dir.join("agent_final.md");
+    let final_message_ref = "artifacts/agent_final.md".to_string();
+    cmd.arg("--output-last-message").arg(&final_message_path);
 
     if !is_git_context(&command_dir, &paths.workspace_dir) {
         cmd.arg("--skip-git-repo-check");
@@ -372,6 +396,7 @@ fn run_codex_exec(
                 wall_budget_seconds,
                 emitted_budget_events,
             )?;
+            fs::write(&final_message_path, [])?;
             events.emit(
                 "agent.exited",
                 &serde_json::json!({
@@ -383,6 +408,8 @@ fn run_codex_exec(
                 status: RunStatus::Failed,
                 commands_used: 0,
                 tool_calls: 0,
+                session_id: None,
+                final_message_ref: Some(final_message_ref),
             });
         }
     };
@@ -396,6 +423,9 @@ fn run_codex_exec(
     fs::write(paths.logs_dir.join("agent.stdout.log"), &output.stdout)?;
     fs::write(paths.logs_dir.join("agent.stderr.log"), &output.stderr)?;
     fs::write(&paths.events_raw, &output.stdout)?;
+    if !final_message_path.exists() {
+        fs::write(&final_message_path, [])?;
+    }
 
     let counts = emit_tool_events_from_raw(&output.stdout, events)?;
     let (status, reason) = if timed_out {
@@ -421,6 +451,8 @@ fn run_codex_exec(
         status,
         commands_used: counts.command_calls,
         tool_calls: counts.tool_calls,
+        session_id: counts.session_id,
+        final_message_ref: Some(final_message_ref),
     })
 }
 
@@ -737,19 +769,30 @@ fn prepare_clone(work_unit: &WorkUnit, run_id: &str, paths: &RunPaths) -> Result
 }
 
 fn resolved_repo_source(repo: &str, repos_dir: &Path) -> Result<PathBuf> {
+    // Always clone into the cache, even for local repos, to avoid mutating user repos.
     let repo_path = Path::new(repo);
-    if repo_path.exists() {
-        return repo_path
+    let (source, name_hint) = if repo_path.exists() {
+        let canonical = repo_path
             .canonicalize()
-            .with_context(|| format!("failed to canonicalize repo path {repo}"));
-    }
+            .with_context(|| format!("failed to canonicalize repo path {repo}"))?;
+        let name = canonical
+            .file_name()
+            .and_then(|v| v.to_str())
+            .unwrap_or("repo")
+            .to_string();
+        (canonical.to_string_lossy().to_string(), name)
+    } else {
+        let name = repo
+            .rsplit('/')
+            .next()
+            .unwrap_or("repo")
+            .trim_end_matches(".git")
+            .to_string();
+        (repo.to_string(), name)
+    };
 
-    let key = short_hash(repo);
-    let name = repo
-        .rsplit('/')
-        .next()
-        .unwrap_or("repo")
-        .trim_end_matches(".git")
+    let key = short_hash(&source);
+    let name = name_hint
         .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
@@ -768,10 +811,10 @@ fn resolved_repo_source(repo: &str, repos_dir: &Path) -> Result<PathBuf> {
     }
 
     command_ok(
-        Command::new("git").arg("clone").arg(repo).arg(&cached),
+        Command::new("git").arg("clone").arg(&source).arg(&cached),
         "git clone source repo",
     )
-    .with_context(|| format!("failed to clone source repo {repo}"))?;
+    .with_context(|| format!("failed to clone source repo {source}"))?;
     Ok(cached)
 }
 
@@ -819,6 +862,37 @@ fn workspace_branch(work_unit: &WorkUnit, run_id: &str) -> Option<String> {
         WorkspaceMode::Scratch => None,
         _ => Some(work_unit.target.branch_slug(run_id)),
     }
+}
+
+fn codex_sandbox(work_unit: &WorkUnit) -> &'static str {
+    if work_unit.authority.mode >= 3
+        && has_capability(
+            work_unit,
+            &[
+                "sandbox.danger-full-access",
+                "danger-full-access",
+                "sandbox.full-access",
+            ],
+        )
+    {
+        return "danger-full-access";
+    }
+
+    if work_unit.authority.mode == 0
+        || matches!(work_unit.tools.command_policy, CommandPolicy::Deny)
+    {
+        return "read-only";
+    }
+
+    "workspace-write"
+}
+
+fn has_capability(work_unit: &WorkUnit, allowed: &[&str]) -> bool {
+    work_unit
+        .authority
+        .capabilities
+        .iter()
+        .any(|cap| allowed.iter().any(|name| cap.name == *name))
 }
 
 fn status_from_exit(status: ExitStatus) -> (RunStatus, &'static str) {
@@ -911,17 +985,27 @@ fn emit_tool_events_from_raw(
 ) -> Result<ToolEventCounts> {
     let text = String::from_utf8_lossy(raw_jsonl);
     let mut counts = ToolEventCounts::default();
+    let mut command_execution_ids = BTreeSet::new();
 
     for line in text.lines() {
         let parsed: Value = match serde_json::from_str(line) {
             Ok(v) => v,
             Err(_) => continue,
         };
+        if counts.session_id.is_none() {
+            counts.session_id = thread_id_from_event(&parsed);
+        }
+        if let Some(cmd_event) = classify_command_execution_event(&parsed) {
+            if command_execution_ids.insert(cmd_event.item_id().to_string()) {
+                counts.command_calls += 1;
+            }
+            emit_agent_command_event(events, cmd_event)?;
+        }
         if let Some(tool_event) = classify_tool_event(&parsed) {
             match tool_event {
                 ParsedToolEvent::Call { tool, args_hash } => {
                     counts.tool_calls += 1;
-                    if is_command_tool_name(&tool) {
+                    if command_execution_ids.is_empty() && is_command_tool_name(&tool) {
                         counts.command_calls += 1;
                     }
                     events.emit(
@@ -951,7 +1035,104 @@ fn emit_tool_events_from_raw(
         }
     }
 
+    if !command_execution_ids.is_empty() {
+        counts.command_calls = command_execution_ids.len() as u64;
+    }
+
     Ok(counts)
+}
+
+fn thread_id_from_event(value: &Value) -> Option<String> {
+    let top_type = value.get("type")?.as_str()?;
+    if top_type == "thread.started" {
+        return value
+            .get("thread_id")
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
+    }
+    if top_type == "item.completed" {
+        let item = value.get("item")?;
+        if item.get("type").and_then(Value::as_str) == Some("thread.started") {
+            return item
+                .get("thread_id")
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+        }
+    }
+    None
+}
+
+enum CommandExecutionEvent {
+    Started { item_id: String, command: String },
+    Completed { item_id: String, exit_code: i64 },
+}
+
+impl CommandExecutionEvent {
+    fn item_id(&self) -> &str {
+        match self {
+            CommandExecutionEvent::Started { item_id, .. } => item_id,
+            CommandExecutionEvent::Completed { item_id, .. } => item_id,
+        }
+    }
+}
+
+fn classify_command_execution_event(value: &Value) -> Option<CommandExecutionEvent> {
+    let top_type = value.get("type")?.as_str()?;
+    if top_type != "item.started" && top_type != "item.completed" {
+        return None;
+    }
+    let item = value.get("item")?;
+    if item.get("type").and_then(Value::as_str) != Some("command_execution") {
+        return None;
+    }
+
+    let item_id = item
+        .get("id")
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .unwrap_or_else(|| hash_json_value(Some(item)));
+
+    if top_type == "item.started" {
+        let command = item
+            .get("command")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        return Some(CommandExecutionEvent::Started { item_id, command });
+    }
+
+    let exit_code = item
+        .get("exit_code")
+        .and_then(Value::as_i64)
+        .or_else(|| {
+            item.get("result")
+                .and_then(|v| v.get("exit_code"))
+                .and_then(Value::as_i64)
+        })
+        .unwrap_or(-1);
+    Some(CommandExecutionEvent::Completed { item_id, exit_code })
+}
+
+fn emit_agent_command_event(events: &mut EventWriter, event: CommandExecutionEvent) -> Result<()> {
+    match event {
+        CommandExecutionEvent::Started { item_id, command } => events.emit(
+            "command.exec",
+            &serde_json::json!({
+                "id": format!("agent-{item_id}"),
+                "cmd": [command],
+                "cwd": null,
+            }),
+        ),
+        CommandExecutionEvent::Completed { item_id, exit_code } => events.emit(
+            "command.result",
+            &serde_json::json!({
+                "id": format!("agent-{item_id}"),
+                "exit_code": exit_code,
+                "stdout_ref": null,
+                "stderr_ref": null,
+            }),
+        ),
+    }
 }
 
 enum ParsedToolEvent {
@@ -1304,6 +1485,12 @@ fn parse_commit_log(stdout: &[u8]) -> Vec<serde_json::Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::work_unit::{
+        Acceptance, Agent, Authority, Budgets, Capability, CommandPolicy, NetworkPolicy, Outputs,
+        Target, Tools, WorkUnit, WorkspaceMode,
+    };
+    use std::collections::HashMap;
+    use std::path::Path;
 
     #[test]
     fn parses_status_paths_with_rename_and_untracked() {
@@ -1439,6 +1626,302 @@ mod tests {
         let counts = emit_tool_events_from_raw(raw, &mut events).expect("parse raw events");
         assert_eq!(counts.tool_calls, 2);
         assert_eq!(counts.command_calls, 1);
+        assert!(counts.session_id.is_none());
+    }
+
+    #[test]
+    fn tool_events_capture_thread_id() {
+        let raw = br#"{"type":"thread.started","thread_id":"thread_123"}
+{"type":"item.completed","item":{"type":"tool_call","tool":"exec_command","arguments":{"cmd":"echo hi"}}}
+"#;
+        let dir = std::env::temp_dir().join(format!("agentctl-tests-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let events_path = dir.join("events.norm.jsonl");
+        let mut events =
+            EventWriter::new("run-test".to_string(), events_path).expect("event writer");
+        let counts = emit_tool_events_from_raw(raw, &mut events).expect("parse raw events");
+        assert_eq!(counts.session_id.as_deref(), Some("thread_123"));
+    }
+
+    #[test]
+    fn command_execution_items_drive_command_count() {
+        let raw = br#"{"type":"item.started","item":{"id":"item_1","type":"command_execution","command":"bash -lc ls"}}
+{"type":"item.completed","item":{"id":"item_1","type":"command_execution","exit_code":0}}
+{"type":"item.completed","item":{"type":"tool_call","tool":"exec_command","arguments":{"cmd":"echo hi"}}}
+"#;
+        let dir = std::env::temp_dir().join(format!("agentctl-tests-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let events_path = dir.join("events.norm.jsonl");
+        let mut events =
+            EventWriter::new("run-test".to_string(), events_path).expect("event writer");
+        let counts = emit_tool_events_from_raw(raw, &mut events).expect("parse raw events");
+        assert_eq!(counts.command_calls, 1);
+        assert_eq!(counts.tool_calls, 1);
+    }
+
+    #[test]
+    fn codex_sandbox_maps_authority_and_policy() {
+        let mut wu = minimal_work_unit();
+        wu.authority.mode = 0;
+        assert_eq!(codex_sandbox(&wu), "read-only");
+
+        wu.authority.mode = 1;
+        wu.tools.command_policy = CommandPolicy::SafeDefault;
+        assert_eq!(codex_sandbox(&wu), "workspace-write");
+
+        wu.authority.mode = 3;
+        wu.authority.capabilities.push(Capability {
+            name: "sandbox.danger-full-access".to_string(),
+            scope: None,
+            ttl_seconds: None,
+            metadata: HashMap::new(),
+        });
+        assert_eq!(codex_sandbox(&wu), "danger-full-access");
+    }
+
+    fn new_test_paths(root: &Path, run_id: &str) -> RunPaths {
+        let runs_dir = root.join("runs");
+        let worktrees_dir = root.join("worktrees");
+        let repos_dir = root.join("repos");
+        fs::create_dir_all(&runs_dir).expect("create runs dir");
+        fs::create_dir_all(&worktrees_dir).expect("create worktrees dir");
+        fs::create_dir_all(&repos_dir).expect("create repos dir");
+
+        let run_dir = runs_dir.join(run_id);
+        let logs_dir = run_dir.join("logs");
+        let artifacts_dir = run_dir.join("artifacts");
+        let receipts_dir = run_dir.join("receipts");
+        fs::create_dir_all(&logs_dir).expect("create logs dir");
+        fs::create_dir_all(&artifacts_dir).expect("create artifacts dir");
+        fs::create_dir_all(&receipts_dir).expect("create receipts dir");
+
+        let workspace_dir = worktrees_dir.join(run_id);
+        fs::create_dir_all(&workspace_dir).expect("create workspace dir");
+
+        let events_raw = run_dir.join("events.raw.jsonl");
+        let events_norm = run_dir.join("events.norm.jsonl");
+        fs::write(&events_raw, []).expect("create raw events");
+        fs::write(&events_norm, []).expect("create norm events");
+
+        RunPaths {
+            root: root.to_path_buf(),
+            run_dir,
+            logs_dir,
+            artifacts_dir,
+            receipts_dir,
+            workspace_dir,
+            events_raw,
+            events_norm,
+            repos_dir,
+            worktrees_dir,
+        }
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .expect("spawn git");
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    fn branch_slug_is_slash_free_and_git_safe() {
+        let target = Target {
+            repo: ".".to_string(),
+            base_ref: "main".to_string(),
+            subdir: Some("a/b c:d".to_string()),
+            workspace_mode: WorkspaceMode::Worktree,
+        };
+        let branch = target.branch_slug("id:with:colon/and/slash");
+        assert!(branch.starts_with("agentctl-run-"));
+        assert!(!branch.contains('/'));
+        assert!(!branch.contains(':'));
+        assert!(!branch.contains(".."));
+        assert!(!branch.ends_with(".lock"));
+        assert!(branch.len() <= 200);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn branch_slug_passes_git_check_ref_format_for_edge_inputs() {
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+
+        let cases = [
+            ("id..with..dots", Some("sub..dir")),
+            ("id:with:colon/and/slash", Some("ends.lock")),
+            ("--weird--..--", Some("...")),
+        ];
+
+        for (run_id, subdir) in cases {
+            let target = Target {
+                repo: ".".to_string(),
+                base_ref: "main".to_string(),
+                subdir: subdir.map(|v| v.to_string()),
+                workspace_mode: WorkspaceMode::Worktree,
+            };
+            let branch = target.branch_slug(run_id);
+            let out = Command::new("git")
+                .arg("check-ref-format")
+                .arg("--branch")
+                .arg(&branch)
+                .output()
+                .expect("spawn git check-ref-format");
+            assert!(
+                out.status.success(),
+                "git rejected branch {:?} (run_id={:?}, subdir={:?}): {}",
+                branch,
+                run_id,
+                subdir,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worktree_does_not_mutate_source_repo_and_survives_runs_leaf_ref() {
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "agentctl-worktree-collision-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let source = root.join("source");
+        fs::create_dir_all(&source).expect("create source repo dir");
+
+        git(&source, &["init"]);
+        git(&source, &["config", "user.email", "test@example.com"]);
+        git(&source, &["config", "user.name", "test"]);
+        fs::write(source.join("README.md"), "hi\n").expect("write file");
+        git(&source, &["add", "."]);
+        git(&source, &["commit", "-m", "init"]);
+        git(&source, &["branch", "-M", "main"]);
+        git(&source, &["branch", "runs"]);
+
+        let run_id = "run-test";
+        let paths = new_test_paths(&root.join("agentd"), run_id);
+        let mut wu = minimal_work_unit();
+        wu.target.repo = source.to_string_lossy().to_string();
+        wu.target.base_ref = "main".to_string();
+        wu.target.workspace_mode = WorkspaceMode::Worktree;
+
+        prepare_worktree(&wu, run_id, &paths).expect("prepare_worktree");
+        assert!(paths.workspace_dir.join(".git").exists());
+
+        let branch = wu.target.branch_slug(run_id);
+        let source_has_branch = Command::new("git")
+            .arg("-C")
+            .arg(&source)
+            .arg("show-ref")
+            .arg("--verify")
+            .arg("--quiet")
+            .arg(format!("refs/heads/{branch}"))
+            .status()
+            .expect("git show-ref source");
+        assert!(!source_has_branch.success());
+
+        let cached = resolved_repo_source(&wu.target.repo, &paths.repos_dir).expect("cached repo");
+        let cached_has_branch = Command::new("git")
+            .arg("-C")
+            .arg(&cached)
+            .arg("show-ref")
+            .arg("--verify")
+            .arg("--quiet")
+            .arg(format!("refs/heads/{branch}"))
+            .status()
+            .expect("git show-ref cached");
+        assert!(cached_has_branch.success());
+    }
+
+    #[test]
+    fn codex_exec_early_budget_still_writes_agent_final_artifact() {
+        let root = std::env::temp_dir().join(format!(
+            "agentctl-agent-final-budget-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let run_id = "run-test";
+        let paths = new_test_paths(&root, run_id);
+        let mut events =
+            EventWriter::new(run_id.to_string(), paths.events_norm.clone()).expect("event writer");
+
+        let mut wu = minimal_work_unit();
+        wu.agent.driver = "codex_exec".to_string();
+        wu.target.workspace_mode = WorkspaceMode::Scratch;
+
+        let timer = Instant::now() - Duration::from_secs(2);
+        let out = run_codex_exec(&wu, &paths, &mut events, &timer, 1, &mut BTreeSet::new())
+            .expect("run_codex_exec");
+        assert_eq!(out.status, RunStatus::Failed);
+        assert_eq!(
+            out.final_message_ref.as_deref(),
+            Some("artifacts/agent_final.md")
+        );
+        assert!(paths.artifacts_dir.join("agent_final.md").exists());
+    }
+
+    fn minimal_work_unit() -> WorkUnit {
+        WorkUnit {
+            version: "runfmt/0.1".to_string(),
+            id: None,
+            kind: "code_pr".to_string(),
+            target: Target {
+                repo: ".".to_string(),
+                base_ref: "main".to_string(),
+                subdir: None,
+                workspace_mode: WorkspaceMode::Scratch,
+            },
+            agent: Agent {
+                driver: "noop".to_string(),
+                model_hint: None,
+                prompt: "test".to_string(),
+                context_files: vec![],
+                personality: None,
+                resume_session_id: None,
+            },
+            env: crate::work_unit::Env {
+                profile: crate::work_unit::EnvProfile::Auto,
+                setup: vec![],
+            },
+            authority: Authority {
+                mode: 1,
+                capabilities: vec![],
+            },
+            tools: Tools {
+                mcp_profile: "docs".to_string(),
+                command_policy: CommandPolicy::SafeDefault,
+                network: NetworkPolicy::Deny,
+            },
+            budgets: Budgets {
+                wall_seconds: 60,
+                max_tool_calls: None,
+                max_commands: None,
+                max_bytes_written: None,
+                max_diff_lines: None,
+            },
+            acceptance: Acceptance {
+                commands: vec![],
+                receipts_required: false,
+            },
+            outputs: Outputs {
+                want_patch: true,
+                want_commits: true,
+                want_handoff: true,
+                push_branch: false,
+                open_pr: false,
+            },
+        }
     }
 
     #[cfg(unix)]

@@ -7,7 +7,6 @@ use serde::Serialize;
 
 use crate::run_id;
 use crate::schema;
-use crate::work_unit::WorkUnit;
 
 #[derive(Serialize)]
 pub struct RunRecord {
@@ -16,6 +15,8 @@ pub struct RunRecord {
     pub kind: String,
     pub status: String,
     pub driver: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_session_id: Option<String>,
     pub started_at: String,
     pub finished_at: String,
     pub spec: Spec,
@@ -57,6 +58,8 @@ pub struct Validation {
 pub struct ArtifactRefs {
     pub diff: String,
     pub handoff: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_final: Option<String>,
 }
 
 pub fn write_run_json(path: &Path, record: &RunRecord) -> Result<()> {
@@ -67,18 +70,19 @@ pub fn write_run_json(path: &Path, record: &RunRecord) -> Result<()> {
     Ok(())
 }
 
-pub fn write_handoff(path: &Path, run_id: &str, work_unit: &WorkUnit, status: &str) -> Result<()> {
+pub fn write_handoff(
+    path: &Path,
+    run_id: &str,
+    repo: &str,
+    branch: Option<&str>,
+    status: &str,
+) -> Result<()> {
     let mut file = File::create(path)?;
     writeln!(file, "# Summary")?;
     writeln!(file, "- **Run:** {}", run_id)?;
     writeln!(file, "- **Status:** {}", status)?;
-    writeln!(file, "- **Repo:** {}", work_unit.target.repo)?;
-    writeln!(
-        file,
-        "- **Branch:** runs/{}/{}",
-        run_id,
-        work_unit.target.branch_slug(run_id)
-    )?;
+    writeln!(file, "- **Repo:** {}", repo)?;
+    writeln!(file, "- **Branch:** {}", branch.unwrap_or("(none)"))?;
     writeln!(file, "\n## Intent\nDescribe the goal.")?;
     writeln!(file, "\n## Changes\n- TBD")?;
     writeln!(file, "\n## Validation\n- lint: pending\n- tests: pending")?;

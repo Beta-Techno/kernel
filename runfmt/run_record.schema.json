@@ -25,6 +25,7 @@
     "kind": {"type": "string", "enum": ["code_pr", "ops", "hybrid"]},
     "status": {"type": "string", "enum": ["ok", "failed", "needs_human"]},
     "driver": {"type": "string"},
+    "agent_session_id": {"type": ["string", "null"]},
     "started_at": {"type": "string", "format": "date-time"},
     "finished_at": {"type": "string", "format": "date-time"},
     "spec": {
@@ -69,7 +70,8 @@
       "type": "object",
       "properties": {
         "diff": {"type": "string"},
-        "handoff": {"type": "string"}
+        "handoff": {"type": "string"},
+        "agent_final": {"type": ["string", "null"]}
       }
     }
   }

@@ -62,7 +62,11 @@
           "items": {"type": "string"},
           "description": "Optional relative paths to include up front."
         },
-        "personality": {"type": ["string", "null"]}
+        "personality": {"type": ["string", "null"]},
+        "resume_session_id": {
+          "type": "string",
+          "description": "Optional prior Codex session/thread ID to resume for this turn."
+        }
       }
     },
     "env": {

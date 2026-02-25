@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 #[derive(Debug, Deserialize)]
 pub struct WorkUnit {
@@ -28,14 +29,65 @@ pub struct Target {
 
 impl Target {
     pub fn branch_slug(&self, run_id: &str) -> String {
-        let slug = self
-            .subdir
-            .as_deref()
-            .unwrap_or("default")
-            .replace('/', "_")
-            .replace(' ', "-");
-        format!("runs/{}/{}", run_id, slug)
+        // Use a slash-free, git-safe branch name to avoid ref namespace collisions.
+        let run = sanitize_ref_component(run_id, "run");
+        let slug = sanitize_ref_component(self.subdir.as_deref().unwrap_or("default"), "default");
+        let name = format!("agentctl-run-{run}-{slug}");
+        truncate_with_hash(name, BRANCH_MAX_LEN)
     }
+}
+
+const BRANCH_MAX_LEN: usize = 200;
+
+fn sanitize_ref_component(raw: &str, default: &str) -> String {
+    let mut out = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    out = out
+        .trim_matches(|c: char| c == '-' || c == '_' || c == '.')
+        .to_string();
+    if out.is_empty() {
+        return default.to_string();
+    }
+    if out.starts_with('-') {
+        out = format!("x{out}");
+    }
+    while out.contains("..") {
+        out = out.replace("..", ".");
+    }
+    if out.ends_with(".lock") {
+        out.push_str("-x");
+    }
+    out
+}
+
+fn truncate_with_hash(value: String, max_len: usize) -> String {
+    if value.len() <= max_len {
+        return value;
+    }
+    let hash = short_hash(&value);
+    let keep = max_len.saturating_sub(hash.len() + 1);
+    let mut prefix = value[..keep]
+        .trim_end_matches(|c: char| c == '-' || c == '_' || c == '.')
+        .to_string();
+    if prefix.is_empty() {
+        prefix = "ref".to_string();
+    }
+    format!("{prefix}-{hash}")
+}
+
+fn short_hash(value: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(value.as_bytes());
+    let full = hex::encode(hasher.finalize());
+    full[..12].to_string()
 }
 
 #[derive(Debug, Deserialize)]
@@ -46,6 +98,7 @@ pub struct Agent {
     #[serde(default)]
     pub context_files: Vec<String>,
     pub personality: Option<String>,
+    pub resume_session_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -153,7 +206,7 @@ fn default_env_profile() -> EnvProfile {
     EnvProfile::Auto
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Copy, Clone, PartialEq, Eq)]
 pub enum CommandPolicy {
     #[serde(rename = "deny")]
     Deny,
