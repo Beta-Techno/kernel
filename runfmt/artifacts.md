@@ -11,7 +11,7 @@ runs/<run_id>/
 ├── env_fingerprint.json   # toolchain snapshot
 ├── artifacts/
 │   ├── diff.patch         # unified diff vs base_ref (may be empty)
-│   ├── changed_files.json # JSON array of paths + stats
+│   ├── changed_files.json # JSON array of changed file paths
 │   ├── commits.json       # optional (list of commits created)
 │   └── agent_final.md     # optional final assistant message from driver
 ├── logs/

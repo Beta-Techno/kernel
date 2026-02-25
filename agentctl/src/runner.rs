@@ -622,8 +622,11 @@ fn write_git_artifacts(
     }
 
     if work_unit.outputs.want_patch {
-        let diff = git_capture(&paths.workspace_dir, ["diff", "--binary"])
-            .context("failed to compute git diff for artifact")?;
+        let diff = git_capture(
+            &paths.workspace_dir,
+            ["diff", "--binary", work_unit.target.base_ref.as_str()],
+        )
+        .context("failed to compute git diff vs base_ref for artifact")?;
         fs::write(&diff_path, &diff.stdout)?;
     } else {
         fs::write(&diff_path, [])?;
@@ -647,29 +650,42 @@ fn write_git_artifacts(
         }),
     )?;
 
-    let numstat = git_capture(&paths.workspace_dir, ["diff", "--numstat"])?;
+    let tracked_changed = git_capture(
+        &paths.workspace_dir,
+        ["diff", "--name-only", work_unit.target.base_ref.as_str()],
+    )
+    .context("failed to compute tracked changed files vs base_ref")?;
+    let mut changed_files = parse_name_only_paths(&tracked_changed.stdout);
+    changed_files.extend(summary.untracked_files.clone());
+    changed_files.sort();
+    changed_files.dedup();
+
+    let numstat = git_capture(
+        &paths.workspace_dir,
+        ["diff", "--numstat", work_unit.target.base_ref.as_str()],
+    )
+    .context("failed to compute numstat vs base_ref")?;
     let (files, insertions, deletions) = parse_numstat(&numstat.stdout);
     let untracked_lines = sum_file_lines(&paths.workspace_dir, &summary.untracked_files);
     let diff_lines = insertions
         .saturating_add(deletions)
         .saturating_add(untracked_lines);
-    let bytes_written =
-        emit_file_write_events(&paths.workspace_dir, &summary.changed_files, events)?;
+    let bytes_written = emit_file_write_events(&paths.workspace_dir, &changed_files, events)?;
     events.emit(
         "git.diff.stats",
         &serde_json::json!({
-            "files": std::cmp::max(files, summary.changed_files.len()),
+            "files": std::cmp::max(files, changed_files.len()),
             "insertions": insertions,
             "deletions": deletions,
             "diff_lines": diff_lines,
         }),
     )?;
 
-    let json = serde_json::to_vec_pretty(&summary.changed_files)?;
+    let json = serde_json::to_vec_pretty(&changed_files)?;
     fs::write(changed_files_path, json)?;
 
     Ok(GitArtifacts {
-        changed_files: summary.changed_files,
+        changed_files,
         diff_lines,
         bytes_written,
     })
@@ -729,6 +745,7 @@ fn prepare_worktree(work_unit: &WorkUnit, run_id: &str, paths: &RunPaths) -> Res
     let branch =
         workspace_branch(work_unit, run_id).context("worktree mode requires a branch name")?;
     let source_repo = resolved_repo_source(&work_unit.target.repo, &paths.repos_dir)?;
+    sync_cached_base_ref(&source_repo, work_unit.target.base_ref.as_str())?;
     reset_workspace_dir(&paths.workspace_dir)?;
     git_ok(
         &source_repo,
@@ -749,6 +766,7 @@ fn prepare_clone(work_unit: &WorkUnit, run_id: &str, paths: &RunPaths) -> Result
     let branch =
         workspace_branch(work_unit, run_id).context("clone mode requires a branch name")?;
     let source_repo = resolved_repo_source(&work_unit.target.repo, &paths.repos_dir)?;
+    sync_cached_base_ref(&source_repo, work_unit.target.base_ref.as_str())?;
     reset_workspace_dir(&paths.workspace_dir)?;
 
     command_ok(
@@ -818,6 +836,34 @@ fn resolved_repo_source(repo: &str, repos_dir: &Path) -> Result<PathBuf> {
     Ok(cached)
 }
 
+fn sync_cached_base_ref(source_repo: &Path, base_ref: &str) -> Result<()> {
+    let remote_ref = format!("refs/remotes/origin/{base_ref}");
+    let mut exists = Command::new("git");
+    exists
+        .arg("-C")
+        .arg(source_repo)
+        .arg("show-ref")
+        .arg("--verify")
+        .arg("--quiet")
+        .arg(&remote_ref);
+    let output = command_capture(&mut exists, "git show-ref")?;
+    if !output.status.success() {
+        return Ok(());
+    }
+
+    let local_ref = format!("refs/heads/{base_ref}");
+    let mut update_ref = Command::new("git");
+    update_ref
+        .arg("-C")
+        .arg(source_repo)
+        .arg("update-ref")
+        .arg(&local_ref)
+        .arg(&remote_ref);
+    command_ok(&mut update_ref, "git update-ref")
+        .with_context(|| format!("failed to sync cached base_ref {base_ref} from origin"))?;
+    Ok(())
+}
+
 fn short_hash(value: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -849,12 +895,28 @@ fn touch_agent_logs(paths: &RunPaths) -> Result<()> {
 fn command_dir(work_unit: &WorkUnit, paths: &RunPaths) -> Result<PathBuf> {
     let mut dir = paths.workspace_dir.clone();
     if let Some(subdir) = &work_unit.target.subdir {
-        dir = dir.join(subdir);
+        let requested = Path::new(subdir);
+        if requested.is_absolute() {
+            bail!("workspace subdir must be relative: {subdir}");
+        }
+        dir = dir.join(requested);
     }
     if !dir.exists() {
         bail!("workspace subdir does not exist: {}", dir.display());
     }
-    Ok(dir)
+    let workspace_root = paths.workspace_dir.canonicalize().with_context(|| {
+        format!(
+            "failed to canonicalize workspace {}",
+            paths.workspace_dir.display()
+        )
+    })?;
+    let dir_canon = dir
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize workspace subdir {}", dir.display()))?;
+    if dir_canon != workspace_root && !dir_canon.starts_with(&workspace_root) {
+        bail!("workspace subdir escapes workspace: {}", dir.display());
+    }
+    Ok(dir_canon)
 }
 
 fn workspace_branch(work_unit: &WorkUnit, run_id: &str) -> Option<String> {
@@ -1410,6 +1472,18 @@ fn parse_numstat(numstat_output: &[u8]) -> (usize, u64, u64) {
     (files, insertions, deletions)
 }
 
+fn parse_name_only_paths(stdout: &[u8]) -> Vec<String> {
+    let text = String::from_utf8_lossy(stdout);
+    let mut paths = BTreeSet::new();
+    for line in text.lines() {
+        let path = line.trim();
+        if !path.is_empty() {
+            paths.insert(path.to_string());
+        }
+    }
+    paths.into_iter().collect()
+}
+
 fn sum_file_lines(workspace_dir: &Path, rel_paths: &[String]) -> u64 {
     rel_paths
         .iter()
@@ -1522,6 +1596,13 @@ mod tests {
         assert_eq!(files, 2);
         assert_eq!(insertions, 13);
         assert_eq!(deletions, 2);
+    }
+
+    #[test]
+    fn parses_name_only_paths() {
+        let changed = b"src/main.rs\nREADME.md\nsrc/main.rs\n\n";
+        let files = parse_name_only_paths(changed);
+        assert_eq!(files, vec!["README.md", "src/main.rs"]);
     }
 
     #[test]
@@ -1785,6 +1866,112 @@ mod tests {
                 String::from_utf8_lossy(&out.stderr)
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_dir_rejects_workspace_escape_paths() {
+        let root =
+            std::env::temp_dir().join(format!("agentctl-command-dir-{}", uuid::Uuid::new_v4()));
+        let paths = new_test_paths(&root, "run-test");
+        let outside = root.join("outside");
+        fs::create_dir_all(&outside).expect("create outside dir");
+        fs::create_dir_all(paths.workspace_dir.join("allowed")).expect("create allowed dir");
+
+        let mut wu = minimal_work_unit();
+        wu.target.workspace_mode = WorkspaceMode::Worktree;
+        wu.target.subdir = Some(outside.display().to_string());
+        let absolute_err = command_dir(&wu, &paths).expect_err("absolute subdir should fail");
+        assert!(absolute_err.to_string().contains("must be relative"));
+
+        wu.target.subdir = Some("../../outside".to_string());
+        let escaped_err = command_dir(&wu, &paths).expect_err("escaping subdir should fail");
+        assert!(escaped_err.to_string().contains("escapes workspace"));
+
+        wu.target.subdir = Some("allowed".to_string());
+        let allowed = command_dir(&wu, &paths).expect("allowed subdir");
+        assert!(allowed.starts_with(paths.workspace_dir.canonicalize().expect("workspace canon")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_artifacts_diff_against_base_ref_includes_clean_committed_delta() {
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "agentctl-artifacts-base-ref-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let paths = new_test_paths(&root, "run-test");
+        git(&paths.workspace_dir, &["init"]);
+        git(
+            &paths.workspace_dir,
+            &["config", "user.email", "test@example.com"],
+        );
+        git(&paths.workspace_dir, &["config", "user.name", "test"]);
+        fs::write(paths.workspace_dir.join("file.txt"), "v1\n").expect("write v1");
+        git(&paths.workspace_dir, &["add", "."]);
+        git(&paths.workspace_dir, &["commit", "-m", "base"]);
+        git(&paths.workspace_dir, &["branch", "-M", "main"]);
+        fs::write(paths.workspace_dir.join("file.txt"), "v2\n").expect("write v2");
+        git(&paths.workspace_dir, &["add", "."]);
+        git(&paths.workspace_dir, &["commit", "-m", "delta"]);
+
+        let mut wu = minimal_work_unit();
+        wu.target.workspace_mode = WorkspaceMode::Worktree;
+        wu.target.base_ref = "HEAD~1".to_string();
+
+        let mut events =
+            EventWriter::new("run-test".to_string(), paths.events_norm.clone()).expect("events");
+        let artifacts = write_git_artifacts(&wu, &paths, &mut events).expect("write git artifacts");
+
+        assert!(artifacts.changed_files.contains(&"file.txt".to_string()));
+        assert!(artifacts.diff_lines > 0);
+        let diff = fs::read_to_string(paths.artifacts_dir.join("diff.patch")).expect("read diff");
+        assert!(!diff.trim().is_empty(), "diff patch should not be empty");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_worktree_syncs_cached_base_ref_to_origin() {
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+
+        let root =
+            std::env::temp_dir().join(format!("agentctl-base-sync-{}", uuid::Uuid::new_v4()));
+        let source = root.join("source");
+        fs::create_dir_all(&source).expect("create source dir");
+        git(&source, &["init"]);
+        git(&source, &["config", "user.email", "test@example.com"]);
+        git(&source, &["config", "user.name", "test"]);
+        fs::write(source.join("README.md"), "v1\n").expect("write v1");
+        git(&source, &["add", "."]);
+        git(&source, &["commit", "-m", "init"]);
+        git(&source, &["branch", "-M", "main"]);
+
+        let root_paths = root.join("agentd");
+        let run1 = new_test_paths(&root_paths, "run-one");
+        let mut wu = minimal_work_unit();
+        wu.target.repo = source.display().to_string();
+        wu.target.base_ref = "main".to_string();
+        wu.target.workspace_mode = WorkspaceMode::Worktree;
+        prepare_worktree(&wu, "run-one", &run1).expect("prepare worktree run one");
+        let run1_content =
+            fs::read_to_string(run1.workspace_dir.join("README.md")).expect("read run one");
+        assert_eq!(run1_content, "v1\n");
+
+        fs::write(source.join("README.md"), "v2\n").expect("write v2");
+        git(&source, &["add", "."]);
+        git(&source, &["commit", "-m", "update"]);
+
+        let run2 = new_test_paths(&root_paths, "run-two");
+        prepare_worktree(&wu, "run-two", &run2).expect("prepare worktree run two");
+        let run2_content =
+            fs::read_to_string(run2.workspace_dir.join("README.md")).expect("read run two");
+        assert_eq!(run2_content, "v2\n");
     }
 
     #[cfg(unix)]

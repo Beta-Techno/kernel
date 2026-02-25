@@ -16,10 +16,10 @@ Everything else (CLI, daemon, MCP gateway) will target this ABI.
 
 Core commands:
 
-- `cargo run -- run --spec /path/to/work-unit.json`
-- `cargo run -- list --limit 20`
-- `cargo run -- show <run_id>`
-- `cargo run -- rerun <run_id>`
+- `cargo run --manifest-path agentctl/Cargo.toml -- run --spec /path/to/work-unit.json`
+- `cargo run --manifest-path agentctl/Cargo.toml -- list --limit 20`
+- `cargo run --manifest-path agentctl/Cargo.toml -- show <run_id>`
+- `cargo run --manifest-path agentctl/Cargo.toml -- rerun <run_id>`
 
 Bundled specs:
 
@@ -28,7 +28,7 @@ Bundled specs:
 
 Smoke run:
 
-- `AGENTD_ROOT=/tmp/agentd-smoke cargo run -- run --spec agentctl/smoke-worktree.json`
+- `AGENTD_ROOT=/tmp/agentd-smoke cargo run --manifest-path agentctl/Cargo.toml -- run --spec agentctl/smoke-worktree.json`
 
 ## Copying context to clipboard
 
