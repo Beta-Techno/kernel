@@ -12,7 +12,8 @@ runs/<run_id>/
 ├── artifacts/
 │   ├── diff.patch         # unified diff vs base_ref (may be empty)
 │   ├── changed_files.json # JSON array of paths + stats
-│   └── commits.json       # optional (list of commits created)
+│   ├── commits.json       # optional (list of commits created)
+│   └── agent_final.md     # optional final assistant message from driver
 ├── logs/
 │   ├── agent.stdout.log
 │   ├── agent.stderr.log
@@ -46,6 +47,7 @@ Skipped artifacts are recorded in `events.norm.jsonl` as `artifact.skipped`.
   "kind": "code_pr",
   "status": "ok | failed | needs_human",
   "driver": "noop | codex_exec | ...",
+  "agent_session_id": "thread_...",
   "started_at": "2026-02-23T18:25:43.511Z",
   "finished_at": "2026-02-23T18:30:12.100Z",
   "spec": {
@@ -55,7 +57,7 @@ Skipped artifacts are recorded in `events.norm.jsonl` as `artifact.skipped`.
   "workspace": {
     "mode": "scratch | worktree | clone",
     "path": "/runner/worktrees/01J...",
-    "branch": "runs/01J.../builder",
+    "branch": "agentctl-run-01J...-builder",
     "base_ref": "main"
   },
   "budgets_used": {
@@ -70,10 +72,14 @@ Skipped artifacts are recorded in `events.norm.jsonl` as `artifact.skipped`.
   },
   "artifacts": {
     "diff": "artifacts/diff.patch",
-    "handoff": "HANDOFF.md"
+    "handoff": "HANDOFF.md",
+    "agent_final": "artifacts/agent_final.md"
   }
 }
 ```
+
+`agent_session_id` is optional and records the driver session/thread identifier when available (for `codex_exec`, this is the `thread.started.thread_id` value).
+`artifacts.agent_final` is optional and records the driver-provided final assistant message when available.
 
 ## HANDOFF.md Template
 
@@ -82,7 +88,7 @@ Skipped artifacts are recorded in `events.norm.jsonl` as `artifact.skipped`.
 - **Run:** <run_id>
 - **Status:** ok | failed | needs_human
 - **Repo:** <repo>
-- **Branch:** runs/<run_id>/<slug>
+- **Branch:** <actual branch> | (none)
 
 ## Intent
 Describe the requested goal and the approach taken.
@@ -110,7 +116,7 @@ Each receipt is JSON:
   "kind": "pull_request",
   "id": "123",
   "url": "https://github.com/...",
-  "description": "Opened PR runs/01J.../builder",
+  "description": "Opened PR agentctl-run-01J...-builder",
   "timestamp": "2026-02-23T18:31:00Z",
   "idempotency_key": "sha256-..."
 }

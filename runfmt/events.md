@@ -8,7 +8,7 @@ Each event is a single JSON object in `events.norm.jsonl` with the shape:
   "ts": "2026-02-23T18:25:43.511Z",
   "run_id": "01J...",
   "type": "workspace.created",
-  "data": { "branch": "runs/01J.../builder" }
+  "data": { "branch": "agentctl-run-01J...-builder" }
 }
 ```
 
@@ -19,7 +19,7 @@ Events are append-only. New event types may be added in backwards-compatible way
 | type | data payload |
 | ---- | ------------- |
 | `run.created` | `{ "kind": "code_pr", "submitted_by": "operator-id" }` |
-| `workspace.created` | `{ "path": "/runner/worktrees/01J...", "mode": "worktree", "branch": "runs/..." }` |
+| `workspace.created` | `{ "path": "/runner/worktrees/01J...", "mode": "worktree", "branch": "agentctl-run-..." }` |
 | `agent.started` | `{ "driver": "codex_exec", "cmd": ["codex","exec","--json",...] }` |
 | `agent.stdout` | `{ "chunk": "base64" }` (only when redaction policy allows) |
 | `agent.stderr` | `{ "chunk": "base64" }` |

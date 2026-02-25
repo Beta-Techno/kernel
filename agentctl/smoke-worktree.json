@@ -2,15 +2,15 @@
   "version": "runfmt/0.1",
   "kind": "code_pr",
   "target": {
-    "repo": "local://example",
+    "repo": ".",
     "base_ref": "main",
     "subdir": null,
-    "workspace_mode": "scratch"
+    "workspace_mode": "worktree"
   },
   "agent": {
     "driver": "noop",
     "model_hint": "gpt-5-codex",
-    "prompt": "Test prompt",
+    "prompt": "Smoke test prompt",
     "context_files": [],
     "personality": null
   },
