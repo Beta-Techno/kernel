@@ -23,8 +23,11 @@
     },
     "id": {
       "type": "string",
-      "description": "Client-supplied identifier or hint; kernel will assign if absent.",
-      "pattern": "^[A-Za-z0-9_.:-]{0,128}$"
+      "description": "Optional run identifier. Must be filesystem-safe for runs/<id>/ and worktrees/<id>/ paths.",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9._-]+$",
+      "not": {"enum": [".", ".."]}
     },
     "kind": {
       "type": "string",

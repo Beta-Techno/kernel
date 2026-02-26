@@ -1,7 +1,7 @@
 use std::fs::{self, File};
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 
 use crate::work_unit::WorkspaceMode;
 
@@ -20,6 +20,10 @@ pub struct RunPaths {
 
 pub fn provision(run_id: &str, _workspace_mode: WorkspaceMode) -> Result<RunPaths> {
     let root = root();
+    provision_at(root, run_id)
+}
+
+fn provision_at(root: PathBuf, run_id: &str) -> Result<RunPaths> {
     let runs_dir = root.join("runs");
     let worktrees_dir = root.join("worktrees");
     let repos_dir = root.join("repos");
@@ -34,6 +38,10 @@ pub fn provision(run_id: &str, _workspace_mode: WorkspaceMode) -> Result<RunPath
     let artifacts_dir = run_dir.join("artifacts");
     let receipts_dir = run_dir.join("receipts");
     let workspace_dir = worktrees_dir.join(run_id);
+
+    if run_dir.exists() || workspace_dir.exists() {
+        bail!("run id already exists: {run_id}");
+    }
 
     for dir in [&run_dir, &logs_dir, &artifacts_dir, &receipts_dir] {
         ensure_dir(dir)?;
@@ -94,4 +102,19 @@ fn ensure_file(path: &PathBuf) -> Result<()> {
         fs::set_permissions(path, perms)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_reused_run_id() {
+        let root = std::env::temp_dir().join(format!("agentctl-run-dir-{}", uuid::Uuid::new_v4()));
+        provision_at(root.clone(), "same-run").expect("first provision should succeed");
+        let second = provision_at(root, "same-run");
+        assert!(second.is_err(), "second provision should fail");
+        let err = second.err().expect("must have error");
+        assert!(err.to_string().contains("run id already exists"));
+    }
 }

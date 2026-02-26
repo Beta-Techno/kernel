@@ -37,6 +37,9 @@ enum Commands {
         /// Path to a WorkUnit file (JSON or TOML).
         #[arg(long, value_name = "FILE")]
         spec: PathBuf,
+        /// Emit machine-readable run result JSON to stdout.
+        #[arg(long)]
+        json: bool,
     },
     /// List recent completed runs.
     List {
@@ -59,7 +62,7 @@ enum Commands {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let code = match cli.command {
-        Commands::Run { spec } => run_spec(&spec)?,
+        Commands::Run { spec, json } => run_spec(&spec, json)?,
         Commands::List { limit } => {
             list_runs(limit)?;
             0
@@ -74,7 +77,7 @@ fn main() -> Result<()> {
     process::exit(code);
 }
 
-fn run_spec(spec_path: &Path) -> Result<i32> {
+fn run_spec(spec_path: &Path, json_output: bool) -> Result<i32> {
     let mut buf = Vec::new();
     File::open(spec_path)
         .with_context(|| format!("unable to open spec {:?}", spec_path))?
@@ -92,7 +95,14 @@ fn run_spec(spec_path: &Path) -> Result<i32> {
         hex::encode(hasher.finalize())
     };
 
-    let run_id = work_unit.id.clone().unwrap_or_else(run_id::new_run_id);
+    let run_id = match work_unit.id.clone() {
+        Some(id) => {
+            run_id::validate_user_run_id(&id)?;
+            id
+        }
+        None => run_id::new_run_id(),
+    };
+    run_id::validate_user_run_id(&run_id)?;
     let paths = provision(&run_id, work_unit.target.workspace_mode)?;
 
     let mut events = EventWriter::new(run_id.clone(), paths.events_norm.clone())?;
@@ -109,11 +119,23 @@ fn run_spec(spec_path: &Path) -> Result<i32> {
         hash: spec_hash,
     };
     let driver_result = execute(&work_unit, &run_id, &spec, &paths, &mut events)?;
-    println!(
-        "run {} completed with status {:?}",
-        run_id, driver_result.status
-    );
-    Ok(driver_result.status.exit_code())
+    let status = status_label(driver_result.status);
+    let exit_code = driver_result.status.exit_code();
+
+    if json_output {
+        let payload = serde_json::json!({
+            "run_id": run_id,
+            "status": status,
+            "exit_code": exit_code,
+            "run_dir": paths.run_dir.display().to_string(),
+            "run_record": paths.run_dir.join("RUN.json").display().to_string(),
+        });
+        println!("{}", serde_json::to_string(&payload)?);
+    } else {
+        // Stable human-readable completion line for wrappers that do not use --json.
+        println!("run {} completed with status {}", run_id, status);
+    }
+    Ok(exit_code)
 }
 
 fn list_runs(limit: usize) -> Result<()> {
@@ -171,7 +193,15 @@ fn rerun(run_id: &str) -> Result<i32> {
             spec_path.display()
         );
     }
-    run_spec(&spec_path)
+    run_spec(&spec_path, false)
+}
+
+fn status_label(status: runner::RunStatus) -> &'static str {
+    match status {
+        runner::RunStatus::Ok => "ok",
+        runner::RunStatus::Failed => "failed",
+        runner::RunStatus::NeedsHuman => "needs_human",
+    }
 }
 
 fn parse_work_unit_value(path: &Path, bytes: &[u8]) -> Result<serde_json::Value> {

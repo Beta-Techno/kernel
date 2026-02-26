@@ -621,13 +621,24 @@ fn write_git_artifacts(
         });
     }
 
+    let status = git_capture(
+        &paths.workspace_dir,
+        ["status", "--porcelain", "-z", "--untracked-files=all"],
+    )?;
+    let summary = parse_status_summary(&status.stdout);
+
     if work_unit.outputs.want_patch {
         let diff = git_capture(
             &paths.workspace_dir,
             ["diff", "--binary", work_unit.target.base_ref.as_str()],
         )
         .context("failed to compute git diff vs base_ref for artifact")?;
-        fs::write(&diff_path, &diff.stdout)?;
+        let diff_bytes = append_untracked_file_diffs(
+            &paths.workspace_dir,
+            diff.stdout,
+            &summary.untracked_files,
+        )?;
+        fs::write(&diff_path, diff_bytes)?;
     } else {
         fs::write(&diff_path, [])?;
         events.emit(
@@ -639,8 +650,6 @@ fn write_git_artifacts(
         )?;
     }
 
-    let status = git_capture(&paths.workspace_dir, ["status", "--porcelain"])?;
-    let summary = parse_status_summary(&status.stdout);
     events.emit(
         "git.status",
         &serde_json::json!({
@@ -1413,6 +1422,67 @@ fn shell_preview(command: &str) -> Vec<String> {
 }
 
 fn parse_status_summary(status_output: &[u8]) -> StatusSummary {
+    if status_output.contains(&0) {
+        return parse_status_summary_null_terminated(status_output);
+    }
+
+    parse_status_summary_line_oriented(status_output)
+}
+
+fn parse_status_summary_null_terminated(status_output: &[u8]) -> StatusSummary {
+    let mut changed_paths = BTreeSet::new();
+    let mut untracked_paths = BTreeSet::new();
+    let mut tracked_count = 0_usize;
+    let mut untracked_count = 0_usize;
+
+    let entries = status_output
+        .split(|b| *b == 0)
+        .filter(|chunk| !chunk.is_empty())
+        .collect::<Vec<_>>();
+
+    let mut idx = 0_usize;
+    while idx < entries.len() {
+        let entry = entries[idx];
+        idx += 1;
+
+        if entry.len() < 3 || entry[2] != b' ' {
+            continue;
+        }
+
+        let status = &entry[..2];
+        let is_untracked = status == b"??";
+        let is_ignored = status == b"!!";
+        let is_rename_or_copy = !is_untracked
+            && (status[0] == b'R' || status[0] == b'C' || status[1] == b'R' || status[1] == b'C');
+
+        let mut path = String::from_utf8_lossy(&entry[3..]).to_string();
+        if is_rename_or_copy && idx < entries.len() {
+            path = String::from_utf8_lossy(entries[idx]).to_string();
+            idx += 1;
+        }
+
+        if path.is_empty() || is_ignored {
+            continue;
+        }
+
+        if is_untracked {
+            untracked_paths.insert(path.clone());
+            untracked_count += 1;
+        } else {
+            tracked_count += 1;
+        }
+        changed_paths.insert(path);
+    }
+
+    StatusSummary {
+        changed_files: changed_paths.into_iter().collect(),
+        untracked_files: untracked_paths.into_iter().collect(),
+        tracked_count,
+        untracked_count,
+    }
+}
+
+fn parse_status_summary_line_oriented(status_output: &[u8]) -> StatusSummary {
     let text = String::from_utf8_lossy(status_output);
     let mut changed_paths = BTreeSet::new();
     let mut untracked_paths = BTreeSet::new();
@@ -1445,6 +1515,48 @@ fn parse_status_summary(status_output: &[u8]) -> StatusSummary {
         tracked_count,
         untracked_count,
     }
+}
+
+fn append_untracked_file_diffs(
+    workspace_dir: &Path,
+    mut tracked_diff: Vec<u8>,
+    untracked_files: &[String],
+) -> Result<Vec<u8>> {
+    for rel_path in untracked_files {
+        let path = workspace_dir.join(rel_path);
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(meta) => meta,
+            Err(_) => continue,
+        };
+        if metadata.is_dir() {
+            continue;
+        }
+
+        let mut cmd = Command::new("git");
+        cmd.arg("-C")
+            .arg(workspace_dir)
+            .arg("-c")
+            .arg("core.quotePath=false")
+            .arg("diff")
+            .arg("--no-index")
+            .arg("--binary")
+            .arg("--")
+            .arg("/dev/null")
+            .arg(rel_path);
+        let output = command_capture(&mut cmd, "git diff --no-index")
+            .with_context(|| format!("failed to compute untracked diff for {rel_path}"))?;
+        match output.status.code() {
+            Some(0) | Some(1) => {
+                tracked_diff.extend_from_slice(&output.stdout);
+            }
+            _ => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                bail!("git diff --no-index failed for {rel_path}: {stderr}");
+            }
+        }
+    }
+
+    Ok(tracked_diff)
 }
 
 fn parse_numstat(numstat_output: &[u8]) -> (usize, u64, u64) {
@@ -1568,16 +1680,29 @@ mod tests {
 
     #[test]
     fn parses_status_paths_with_rename_and_untracked() {
-        let status = b" M src/main.rs\nR  old.txt -> new.txt\n?? notes.md\n";
+        let status = b" M src/main.rs\0R  old name.txt\0new name.txt\0?? notes space.md\0";
         let summary = parse_status_summary(status);
         assert_eq!(
             summary.changed_files,
-            vec!["new.txt", "notes.md", "src/main.rs"]
+            vec!["new name.txt", "notes space.md", "src/main.rs"]
         );
     }
 
     #[test]
     fn parses_status_summary_counts() {
+        let status = b" M src/main.rs\0R  old.txt\0new.txt\0?? notes.md\0";
+        let summary = parse_status_summary(status);
+        assert_eq!(
+            summary.changed_files,
+            vec!["new.txt", "notes.md", "src/main.rs"]
+        );
+        assert_eq!(summary.untracked_files, vec!["notes.md"]);
+        assert_eq!(summary.tracked_count, 2);
+        assert_eq!(summary.untracked_count, 1);
+    }
+
+    #[test]
+    fn parses_status_summary_legacy_line_oriented_format() {
         let status = b" M src/main.rs\nR  old.txt -> new.txt\n?? notes.md\n";
         let summary = parse_status_summary(status);
         assert_eq!(
@@ -1918,6 +2043,12 @@ mod tests {
         fs::write(paths.workspace_dir.join("file.txt"), "v2\n").expect("write v2");
         git(&paths.workspace_dir, &["add", "."]);
         git(&paths.workspace_dir, &["commit", "-m", "delta"]);
+        fs::create_dir_all(paths.workspace_dir.join("docs")).expect("create docs");
+        fs::write(
+            paths.workspace_dir.join("docs/new note.md"),
+            "line 1\nline 2\n",
+        )
+        .expect("write untracked");
 
         let mut wu = minimal_work_unit();
         wu.target.workspace_mode = WorkspaceMode::Worktree;
@@ -1928,9 +2059,18 @@ mod tests {
         let artifacts = write_git_artifacts(&wu, &paths, &mut events).expect("write git artifacts");
 
         assert!(artifacts.changed_files.contains(&"file.txt".to_string()));
+        assert!(
+            artifacts
+                .changed_files
+                .contains(&"docs/new note.md".to_string())
+        );
         assert!(artifacts.diff_lines > 0);
         let diff = fs::read_to_string(paths.artifacts_dir.join("diff.patch")).expect("read diff");
         assert!(!diff.trim().is_empty(), "diff patch should not be empty");
+        assert!(
+            diff.contains("+++ b/docs/new note.md"),
+            "diff patch should include untracked file additions"
+        );
     }
 
     #[cfg(unix)]

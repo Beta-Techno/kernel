@@ -7,6 +7,7 @@ Layer 1 of the autonomous minds substrate: a minimal, verifiable kernel that run
 - `runfmt/work_unit.schema.json` — JSON Schema for WorkUnit submissions.
 - `runfmt/events.md` — normalized event registry for `events.norm.jsonl`.
 - `runfmt/artifacts.md` — artifact bundle contract (RUN.json, HANDOFF, receipts, etc.).
+- `runfmt/conductor.md` — Conductor integration contract for invoking `agentctl` and consuming artifacts.
 
 Everything else (CLI, daemon, MCP gateway) will target this ABI.
 
@@ -17,6 +18,7 @@ Everything else (CLI, daemon, MCP gateway) will target this ABI.
 Core commands:
 
 - `cargo run --manifest-path agentctl/Cargo.toml -- run --spec /path/to/work-unit.json`
+- `cargo run --manifest-path agentctl/Cargo.toml -- run --spec /path/to/work-unit.json --json`
 - `cargo run --manifest-path agentctl/Cargo.toml -- list --limit 20`
 - `cargo run --manifest-path agentctl/Cargo.toml -- show <run_id>`
 - `cargo run --manifest-path agentctl/Cargo.toml -- rerun <run_id>`

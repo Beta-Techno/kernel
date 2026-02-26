@@ -53,4 +53,15 @@ mod tests {
         let err = validate_work_unit(&sample).expect_err("validation must fail");
         assert!(err.to_string().contains("schema validation failed"));
     }
+
+    #[test]
+    fn rejects_invalid_work_unit_ids() {
+        for bad_id in ["", ".", "..", "a:b", "a/b"] {
+            let mut sample: Value =
+                serde_json::from_str(include_str!("../runfmt-example.json")).expect("valid sample");
+            sample["id"] = Value::String(bad_id.to_string());
+            let err = validate_work_unit(&sample).expect_err("validation must fail");
+            assert!(err.to_string().contains("schema validation failed"));
+        }
+    }
 }
