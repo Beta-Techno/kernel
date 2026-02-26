@@ -1,4 +1,5 @@
 use std::fs::{self, File};
+use std::io::ErrorKind;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
@@ -39,15 +40,15 @@ fn provision_at(root: PathBuf, run_id: &str) -> Result<RunPaths> {
     let receipts_dir = run_dir.join("receipts");
     let workspace_dir = worktrees_dir.join(run_id);
 
-    if run_dir.exists() || workspace_dir.exists() {
-        bail!("run id already exists: {run_id}");
+    ensure_new_dir(&run_dir, run_id)?;
+    if let Err(err) = ensure_new_dir(&workspace_dir, run_id) {
+        let _ = fs::remove_dir_all(&run_dir);
+        return Err(err);
     }
 
-    for dir in [&run_dir, &logs_dir, &artifacts_dir, &receipts_dir] {
+    for dir in [&logs_dir, &artifacts_dir, &receipts_dir] {
         ensure_dir(dir)?;
     }
-
-    ensure_dir(&workspace_dir)?;
 
     let events_raw = run_dir.join("events.raw.jsonl");
     let events_norm = run_dir.join("events.norm.jsonl");
@@ -102,6 +103,24 @@ fn ensure_file(path: &PathBuf) -> Result<()> {
         fs::set_permissions(path, perms)?;
     }
     Ok(())
+}
+
+fn ensure_new_dir(path: &PathBuf, run_id: &str) -> Result<()> {
+    match fs::create_dir(path) {
+        Ok(()) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let perms = fs::Permissions::from_mode(0o700);
+                fs::set_permissions(path, perms)?;
+            }
+            Ok(())
+        }
+        Err(err) if err.kind() == ErrorKind::AlreadyExists => {
+            bail!("run id already exists: {run_id}")
+        }
+        Err(err) => Err(err).with_context(|| format!("failed to create dir {:?}", path)),
+    }
 }
 
 #[cfg(test)]

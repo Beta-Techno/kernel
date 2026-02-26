@@ -5,6 +5,7 @@ Each event is a single JSON object in `events.norm.jsonl` with the shape:
 ```json
 {
   "v": "runfmt/0.1",
+  "seq": 12,
   "ts": "2026-02-23T18:25:43.511Z",
   "run_id": "01J...",
   "type": "workspace.created",
@@ -25,7 +26,7 @@ Events are append-only. New event types may be added in backwards-compatible way
 | `agent.stderr` | `{ "chunk": "base64" }` |
 | `agent.exited` | `{ "exit_code": 0, "reason": "completed" }` |
 | `run.interrupted` | `{ "reason": "operator", "signal": "SIGTERM" }` |
-| `run.finished` | `{ "status": "ok|failed|canceled", "summary_ref": "RUN.json" }` |
+| `run.finished` | `{ "status": "ok|failed|needs_human", "summary_ref": "RUN.json" }` |
 | `artifact.skipped` | `{ "artifact": "artifacts/diff.patch", "reason": "outputs.want_patch=false" }` |
 
 ## Policy & Budgets
@@ -72,3 +73,4 @@ Events are append-only. New event types may be added in backwards-compatible way
 - `agent.stdout` / `agent.stderr` chunks are base64-encoded after redaction. Store large blobs as files when possible and reference via `_ref` fields.
 - `receipt.recorded` is mandatory for ops modes where `acceptance.receipts_required = true`.
 - Event order is chronological; consumers MUST NOT assume contiguous event types.
+- `seq` is a monotonically increasing per-run event counter starting at `1`.

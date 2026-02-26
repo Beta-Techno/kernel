@@ -81,7 +81,7 @@ impl RunStatus {
         match self {
             RunStatus::Ok => "ok",
             RunStatus::Failed => "failed",
-            RunStatus::NeedsHuman => "canceled",
+            RunStatus::NeedsHuman => "needs_human",
         }
     }
 }

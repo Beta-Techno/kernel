@@ -32,7 +32,8 @@ run <run_id> completed with status <ok|failed|needs_human>
 
 ## Run ID Rules
 
-Conductor may provide `work_unit.id`; otherwise kernel generates a UUID.
+Conductor should always provide `work_unit.id` and treat it as the authoritative job attempt id.
+This avoids ambiguity if `agentctl` exits before printing output.
 
 Accepted IDs:
 
@@ -41,6 +42,8 @@ Accepted IDs:
 - not `"."` and not `".."`
 
 Rejected IDs fail fast before workspace creation.
+
+If `work_unit.id` is omitted, kernel generates a UUID. Conductor wrappers should avoid this mode for production orchestration.
 
 ## Run ID Reuse Policy
 
