@@ -851,6 +851,8 @@ fn prepare_worktree(work_unit: &WorkUnit, run_id: &str, paths: &RunPaths) -> Res
     let branch =
         workspace_branch(work_unit, run_id).context("worktree mode requires a branch name")?;
     let source_repo = resolved_repo_source(&work_unit.target.repo, &paths.repos_dir)?;
+    let base_commit = resolve_base_ref_commit(&source_repo, &work_unit.target.base_ref)
+        .with_context(|| format!("failed to resolve base_ref {}", work_unit.target.base_ref))?;
     reset_workspace_dir(&paths.workspace_dir)?;
     git_ok(
         &source_repo,
@@ -860,7 +862,7 @@ fn prepare_worktree(work_unit: &WorkUnit, run_id: &str, paths: &RunPaths) -> Res
             "-B",
             branch.as_str(),
             &paths.workspace_dir.display().to_string(),
-            work_unit.target.base_ref.as_str(),
+            base_commit.as_str(),
         ],
     )
     .context("failed to create git worktree for run")?;
@@ -871,6 +873,8 @@ fn prepare_clone(work_unit: &WorkUnit, run_id: &str, paths: &RunPaths) -> Result
     let branch =
         workspace_branch(work_unit, run_id).context("clone mode requires a branch name")?;
     let source_repo = resolved_repo_source(&work_unit.target.repo, &paths.repos_dir)?;
+    let base_commit = resolve_base_ref_commit(&source_repo, &work_unit.target.base_ref)
+        .with_context(|| format!("failed to resolve base_ref {}", work_unit.target.base_ref))?;
     reset_workspace_dir(&paths.workspace_dir)?;
 
     command_ok(
@@ -880,11 +884,8 @@ fn prepare_clone(work_unit: &WorkUnit, run_id: &str, paths: &RunPaths) -> Result
             .arg(&paths.workspace_dir),
         "git clone",
     )?;
-    git_ok(
-        &paths.workspace_dir,
-        ["checkout", work_unit.target.base_ref.as_str()],
-    )
-    .context("failed to checkout base_ref in clone mode")?;
+    git_ok(&paths.workspace_dir, ["checkout", base_commit.as_str()])
+        .context("failed to checkout base_ref in clone mode")?;
     git_ok(&paths.workspace_dir, ["checkout", "-B", branch.as_str()])
         .context("failed to create run branch in clone mode")?;
     Ok(())
@@ -938,6 +939,44 @@ fn resolved_repo_source(repo: &str, repos_dir: &Path) -> Result<PathBuf> {
     )
     .with_context(|| format!("failed to clone source repo {source}"))?;
     Ok(cached)
+}
+
+fn resolve_base_ref_commit(source_repo: &Path, base_ref: &str) -> Result<String> {
+    if should_try_origin_tracking_ref(base_ref) {
+        let origin_ref = format!("refs/remotes/origin/{base_ref}");
+        if git_ref_exists(source_repo, &origin_ref)? {
+            return git_rev_parse_commit(source_repo, &origin_ref);
+        }
+    }
+    git_rev_parse_commit(source_repo, base_ref)
+}
+
+fn should_try_origin_tracking_ref(base_ref: &str) -> bool {
+    !base_ref.starts_with("refs/")
+}
+
+fn git_ref_exists(repo: &Path, ref_name: &str) -> Result<bool> {
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .arg("show-ref")
+        .arg("--verify")
+        .arg("--quiet")
+        .arg(ref_name)
+        .status()
+        .with_context(|| format!("failed to check ref existence for {ref_name}"))?;
+    Ok(status.success())
+}
+
+fn git_rev_parse_commit(repo: &Path, rev: &str) -> Result<String> {
+    let expr = format!("{rev}^{{commit}}");
+    let out = git_capture(repo, ["rev-parse", expr.as_str()])
+        .with_context(|| format!("failed to resolve commit for {rev}"))?;
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if sha.is_empty() {
+        bail!("git rev-parse produced empty commit for {rev}");
+    }
+    Ok(sha)
 }
 
 fn short_hash(value: &str) -> String {
@@ -1969,6 +2008,94 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn worktree_uses_refreshed_origin_tip_for_named_base_ref() {
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "agentctl-worktree-stale-cache-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let source = root.join("source");
+        fs::create_dir_all(&source).expect("create source repo dir");
+
+        git(&source, &["init"]);
+        git(&source, &["config", "user.email", "test@example.com"]);
+        git(&source, &["config", "user.name", "test"]);
+        fs::write(source.join("README.md"), "base\n").expect("write file");
+        git(&source, &["add", "."]);
+        git(&source, &["commit", "-m", "init"]);
+        git(&source, &["branch", "-M", "main"]);
+
+        let run_id = "stale-worktree-run";
+        let paths = new_test_paths(&root.join("agentd"), run_id);
+        let mut wu = minimal_work_unit();
+        wu.target.repo = source.to_string_lossy().to_string();
+        wu.target.base_ref = "main".to_string();
+        wu.target.workspace_mode = WorkspaceMode::Worktree;
+
+        resolved_repo_source(&wu.target.repo, &paths.repos_dir).expect("prime cache");
+
+        fs::write(source.join("README.md"), "base\nfresh\n").expect("update source file");
+        git(&source, &["add", "README.md"]);
+        git(&source, &["commit", "-m", "advance main"]);
+        let expected_sha = git_rev_parse_output(&source, "main");
+
+        prepare_worktree(&wu, run_id, &paths).expect("prepare_worktree");
+        let workspace_sha = git_rev_parse_output(&paths.workspace_dir, "HEAD");
+        assert_eq!(
+            workspace_sha, expected_sha,
+            "worktree should start from refreshed origin/main tip"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clone_uses_refreshed_origin_tip_for_named_base_ref() {
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "agentctl-clone-stale-cache-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let source = root.join("source");
+        fs::create_dir_all(&source).expect("create source repo dir");
+
+        git(&source, &["init"]);
+        git(&source, &["config", "user.email", "test@example.com"]);
+        git(&source, &["config", "user.name", "test"]);
+        fs::write(source.join("README.md"), "base\n").expect("write file");
+        git(&source, &["add", "."]);
+        git(&source, &["commit", "-m", "init"]);
+        git(&source, &["branch", "-M", "main"]);
+
+        let run_id = "stale-clone-run";
+        let paths = new_test_paths(&root.join("agentd"), run_id);
+        let mut wu = minimal_work_unit();
+        wu.target.repo = source.to_string_lossy().to_string();
+        wu.target.base_ref = "main".to_string();
+        wu.target.workspace_mode = WorkspaceMode::Clone;
+
+        resolved_repo_source(&wu.target.repo, &paths.repos_dir).expect("prime cache");
+
+        fs::write(source.join("README.md"), "base\nfresh-clone\n").expect("update source file");
+        git(&source, &["add", "README.md"]);
+        git(&source, &["commit", "-m", "advance main clone"]);
+        let expected_sha = git_rev_parse_output(&source, "main");
+
+        prepare_clone(&wu, run_id, &paths).expect("prepare_clone");
+        let workspace_sha = git_rev_parse_output(&paths.workspace_dir, "HEAD");
+        assert_eq!(
+            workspace_sha, expected_sha,
+            "clone should start from refreshed origin/main tip"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn two_turn_continuation_uses_final_sha_for_dirty_workspace() {
         if Command::new("git").arg("--version").output().is_err() {
             return;
@@ -2379,6 +2506,22 @@ mod tests {
                 open_pr: false,
             },
         }
+    }
+
+    fn git_rev_parse_output(repo: &Path, rev: &str) -> String {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .arg("rev-parse")
+            .arg(rev)
+            .output()
+            .expect("rev-parse");
+        assert!(
+            out.status.success(),
+            "rev-parse failed for {rev}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
     #[cfg(unix)]
