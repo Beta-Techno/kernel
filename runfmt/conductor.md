@@ -72,6 +72,9 @@ Wrappers should consume:
 - `runs/<run_id>/artifacts/diff.patch`
 - `runs/<run_id>/artifacts/changed_files.json`
 - `runs/<run_id>/artifacts/commits.json`
+- `runs/<run_id>/spec/work_unit.json`
 
 `diff.patch` and `changed_files.json` are computed from `workspace.base_sha..workspace.final_sha`.
 `commits.json` contains user/agent commits only (kernel synthetic continuation snapshots are excluded).
+
+For replay, wrappers should prefer `RUN.json.spec.snapshot_path` over `RUN.json.spec.path`.

@@ -40,7 +40,8 @@
       "required": ["path", "hash"],
       "properties": {
         "path": {"type": "string"},
-        "hash": {"type": "string"}
+        "hash": {"type": "string"},
+        "snapshot_path": {"type": ["string", "null"]}
       }
     },
     "workspace": {

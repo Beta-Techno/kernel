@@ -2002,6 +2002,7 @@ mod tests {
         let spec_1 = Spec {
             path: "run-1.json".to_string(),
             hash: "hash-1".to_string(),
+            snapshot_path: None,
         };
 
         let out_1 = execute(&wu_1, run_id_1, &spec_1, &paths_1, &mut events_1).expect("run 1");
@@ -2070,6 +2071,7 @@ mod tests {
         let spec_2 = Spec {
             path: "run-2.json".to_string(),
             hash: "hash-2".to_string(),
+            snapshot_path: None,
         };
 
         let out_2 = execute(&wu_2, run_id_2, &spec_2, &paths_2, &mut events_2).expect("run 2");

@@ -31,6 +31,8 @@ pub struct RunRecord {
 pub struct Spec {
     pub path: String,
     pub hash: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot_path: Option<String>,
 }
 
 #[derive(Serialize)]

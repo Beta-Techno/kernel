@@ -24,6 +24,8 @@ Core commands:
 - `cargo run -- show <run_id>`
 - `cargo run -- rerun <run_id>`
 
+`rerun` prefers the run-bundled WorkUnit snapshot at `runs/<run_id>/spec/work_unit.json` when present.
+
 Bundled specs:
 
 - `agentctl/runfmt-example.json` — deterministic schema/offline example (`workspace_mode: scratch`, `driver: noop`).

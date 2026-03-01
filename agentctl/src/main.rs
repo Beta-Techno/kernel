@@ -54,7 +54,7 @@ enum Commands {
     },
     /// Re-execute the original spec from a previous run.
     Rerun {
-        /// Run ID to replay using its stored spec.path.
+        /// Run ID to replay using its stored spec snapshot (fallback: spec.path).
         run_id: String,
     },
 }
@@ -85,6 +85,8 @@ fn run_spec(spec_path: &Path, json_output: bool) -> Result<i32> {
 
     let work_unit_value = parse_work_unit_value(spec_path, &buf)?;
     schema::validate_work_unit(&work_unit_value)?;
+    let normalized_work_unit = serde_json::to_vec_pretty(&work_unit_value)
+        .context("failed to serialize normalized WorkUnit snapshot")?;
     let work_unit: WorkUnit =
         serde_json::from_value(work_unit_value).context("failed to deserialize WorkUnit")?;
 
@@ -97,6 +99,14 @@ fn run_spec(spec_path: &Path, json_output: bool) -> Result<i32> {
 
     let run_id = work_unit.id.clone().unwrap_or_else(run_id::new_run_id);
     let paths = provision(&run_id, work_unit.target.workspace_mode)?;
+    let spec_snapshot_rel = "spec/work_unit.json".to_string();
+    let spec_snapshot_path = paths.run_dir.join(&spec_snapshot_rel);
+    if let Some(parent) = spec_snapshot_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    fs::write(&spec_snapshot_path, &normalized_work_unit)
+        .with_context(|| format!("failed to write {}", spec_snapshot_path.display()))?;
 
     let mut events = EventWriter::new(run_id.clone(), paths.events_norm.clone())?;
     events.emit(
@@ -110,6 +120,7 @@ fn run_spec(spec_path: &Path, json_output: bool) -> Result<i32> {
     let spec = Spec {
         path: spec_path.display().to_string(),
         hash: spec_hash,
+        snapshot_path: Some(spec_snapshot_rel),
     };
     let driver_result = execute(&work_unit, &run_id, &spec, &paths, &mut events)?;
     let exit_code = driver_result.status.exit_code();
@@ -182,7 +193,10 @@ fn rerun(run_id: &str) -> Result<i32> {
         fs::read(&run_json).with_context(|| format!("failed to read {}", run_json.display()))?;
     let record: RunSpecRef =
         serde_json::from_slice(&bytes).context("failed to parse RUN.json for rerun")?;
-    let spec_path = PathBuf::from(&record.spec.path);
+    let run_dir = run_json
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("invalid run path: {}", run_json.display()))?;
+    let spec_path = resolve_rerun_spec_path(run_dir, &record.spec);
     if !spec_path.exists() {
         anyhow::bail!(
             "spec path from RUN.json does not exist: {}",
@@ -190,6 +204,17 @@ fn rerun(run_id: &str) -> Result<i32> {
         );
     }
     run_spec(&spec_path, false)
+}
+
+fn resolve_rerun_spec_path(run_dir: &Path, spec: &RunSpecPath) -> PathBuf {
+    if let Some(snapshot_path) = &spec.snapshot_path {
+        let snapshot = PathBuf::from(snapshot_path);
+        if snapshot.is_absolute() {
+            return snapshot;
+        }
+        return run_dir.join(snapshot);
+    }
+    PathBuf::from(&spec.path)
 }
 
 fn parse_work_unit_value(path: &Path, bytes: &[u8]) -> Result<serde_json::Value> {
@@ -219,4 +244,43 @@ struct RunSpecRef {
 #[derive(Debug, Deserialize)]
 struct RunSpecPath {
     path: String,
+    snapshot_path: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rerun_uses_relative_snapshot_path_when_present() {
+        let run_dir = PathBuf::from("/tmp/agentd/runs/run-1");
+        let spec = RunSpecPath {
+            path: "/old/spec.json".to_string(),
+            snapshot_path: Some("spec/work_unit.json".to_string()),
+        };
+        let resolved = resolve_rerun_spec_path(&run_dir, &spec);
+        assert_eq!(resolved, run_dir.join("spec/work_unit.json"));
+    }
+
+    #[test]
+    fn rerun_uses_absolute_snapshot_path_when_present() {
+        let run_dir = PathBuf::from("/tmp/agentd/runs/run-1");
+        let spec = RunSpecPath {
+            path: "/old/spec.json".to_string(),
+            snapshot_path: Some("/tmp/snapshots/work_unit.json".to_string()),
+        };
+        let resolved = resolve_rerun_spec_path(&run_dir, &spec);
+        assert_eq!(resolved, PathBuf::from("/tmp/snapshots/work_unit.json"));
+    }
+
+    #[test]
+    fn rerun_falls_back_to_original_spec_path() {
+        let run_dir = PathBuf::from("/tmp/agentd/runs/run-1");
+        let spec = RunSpecPath {
+            path: "/old/spec.json".to_string(),
+            snapshot_path: None,
+        };
+        let resolved = resolve_rerun_spec_path(&run_dir, &spec);
+        assert_eq!(resolved, PathBuf::from("/old/spec.json"));
+    }
 }

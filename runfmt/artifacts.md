@@ -19,6 +19,8 @@ runs/<run_id>/
 │   ├── agent.stderr.log
 │   ├── validate.stdout.log
 │   └── validate.stderr.log
+├── spec/
+│   └── work_unit.json      # normalized submitted WorkUnit snapshot used by rerun
 ├── receipts/              # side-effect receipts (required for ops)
 │   └── <source>/<timestamp>_<id>.json
 └── workspace/             # optional symlink pointing to worktrees/<run_id>/
@@ -52,7 +54,8 @@ Skipped artifacts are recorded in `events.norm.jsonl` as `artifact.skipped`.
   "finished_at": "2026-02-23T18:30:12.100Z",
   "spec": {
     "path": "runfmt/examples/noop.toml",
-    "hash": "<sha256 hex of raw spec bytes>"
+    "hash": "<sha256 hex of raw spec bytes>",
+    "snapshot_path": "spec/work_unit.json"
   },
   "workspace": {
     "mode": "scratch | worktree | clone",
@@ -86,6 +89,7 @@ Skipped artifacts are recorded in `events.norm.jsonl` as `artifact.skipped`.
 `workspace.continuation_ref` is a kernel-managed ref pointing at `workspace.final_sha` so the snapshot remains reachable.
 For continuation, set next run `target.base_ref` to the prior `workspace.final_sha`.
 `artifacts/commits.json` includes agent-created commits only; kernel synthetic snapshot commits are excluded.
+`spec.snapshot_path` points to the normalized submitted WorkUnit snapshot inside the run bundle. `agentctl rerun <run_id>` should use this snapshot first.
 
 `agent_session_id` is optional and records the driver session/thread identifier when available (for `codex_exec`, this is the `thread.started.thread_id` value).
 `artifacts.agent_final` is optional and records the driver-provided final assistant message when available.
