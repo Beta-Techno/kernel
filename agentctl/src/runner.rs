@@ -1385,6 +1385,49 @@ fn parse_status_summary(status_output: &[u8]) -> StatusSummary {
     }
 }
 
+fn append_untracked_file_diffs(
+    workspace_dir: &Path,
+    mut tracked_diff: Vec<u8>,
+    untracked_files: &[String],
+) -> Result<Vec<u8>> {
+    let null_path = if cfg!(windows) { "NUL" } else { "/dev/null" };
+
+    for rel_path in untracked_files {
+        let path = workspace_dir.join(rel_path);
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(meta) => meta,
+            Err(_) => continue,
+        };
+        if metadata.is_dir() {
+            continue;
+        }
+
+        let mut cmd = Command::new("git");
+        cmd.arg("-C")
+            .arg(workspace_dir)
+            .arg("-c")
+            .arg("core.quotePath=false")
+            .arg("diff")
+            .arg("--no-index")
+            .arg("--binary")
+            .arg("--")
+            .arg(null_path)
+            .arg(rel_path);
+        let output = command_capture(&mut cmd, "git diff --no-index")
+            .with_context(|| format!("failed to compute untracked diff for {rel_path}"))?;
+        match output.status.code() {
+            Some(0) | Some(1) => {
+                tracked_diff.extend_from_slice(&output.stdout);
+            }
+            _ => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                bail!("git diff --no-index failed for {rel_path}: {stderr}");
+            }
+        }
+    }
+
+    Ok(tracked_diff)
+}
 fn parse_numstat(numstat_output: &[u8]) -> (usize, u64, u64) {
     let text = String::from_utf8_lossy(numstat_output);
     let mut files = 0_usize;

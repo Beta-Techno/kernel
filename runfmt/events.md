@@ -41,7 +41,7 @@ Events are append-only. New event types may be added in backwards-compatible way
 | type | data |
 | ---- | ---- |
 | `git.status` | `{ "clean": false, "tracked": 2, "untracked": 1 }` |
-| `git.diff.stats` | `{ "files": 1, "insertions": 12, "deletions": 0 }` |
+| `git.diff.stats` | `{ "files": 1, "insertions": 12, "deletions": 0, "diff_lines": 12 }` |
 | `git.commits` | `{ "count": 2, "artifact": "artifacts/commits.json" }` |
 | `file.write` | `{ "path": "AGENT_KERNEL_SMOKE_TEST.md", "bytes": 128 }` (coarse-grained) |
 

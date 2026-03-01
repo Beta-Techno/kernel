@@ -20,7 +20,14 @@
     "artifacts"
   ],
   "properties": {
-    "run_id": {"type": "string"},
+    "run_id": {
+      "type": "string",
+      "description": "Filesystem-safe run identifier for runs/<id>/ and worktrees/<id>/.",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9._-]+$",
+      "not": {"enum": [".", ".."]}
+    },
     "version": {"type": "string", "const": "runfmt/0.1"},
     "kind": {"type": "string", "enum": ["code_pr", "ops", "hybrid"]},
     "status": {"type": "string", "enum": ["ok", "failed", "needs_human"]},

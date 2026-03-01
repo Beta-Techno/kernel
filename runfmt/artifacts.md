@@ -1,6 +1,6 @@
 # runfmt/0.1 Artifact Contract
 
-Every run produces `runs/<run_id>/` with the following mandatory structure. Missing files indicate the run is invalid.
+Every run produces `runs/<run_id>/` with the following structure. Entries marked **optional** may be absent; everything else is mandatory (files may be empty). Missing mandatory files indicate the run is invalid.
 
 ```
 runs/<run_id>/
@@ -11,8 +11,8 @@ runs/<run_id>/
 ├── env_fingerprint.json   # toolchain snapshot
 ├── artifacts/
 │   ├── diff.patch         # unified diff vs base_ref (may be empty)
-│   ├── changed_files.json # JSON array of paths + stats
-│   ├── commits.json       # optional (list of commits created)
+│   ├── changed_files.json # JSON array of changed file paths
+│   ├── commits.json       # list of commits created (may be [] when none or want_commits=false)
 │   └── agent_final.md     # optional final assistant message from driver
 ├── logs/
 │   ├── agent.stdout.log
@@ -52,7 +52,7 @@ Skipped artifacts are recorded in `events.norm.jsonl` as `artifact.skipped`.
   "finished_at": "2026-02-23T18:30:12.100Z",
   "spec": {
     "path": "runfmt/examples/noop.toml",
-    "hash": "sha256-..."
+    "hash": "<sha256 hex of raw spec bytes>"
   },
   "workspace": {
     "mode": "scratch | worktree | clone",
