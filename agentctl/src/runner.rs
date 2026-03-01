@@ -107,6 +107,7 @@ pub fn execute(
     let branch = workspace_branch(work_unit, run_id);
 
     prepare_workspace(work_unit, run_id, paths)?;
+    let base_sha = workspace_base_sha(work_unit, paths)?;
 
     events.emit(
         "workspace.created",
@@ -193,7 +194,6 @@ pub fn execute(
         final_status = RunStatus::Failed;
     }
 
-    let base_sha = workspace_base_sha(work_unit, paths)?;
     let continuation = resolve_workspace_continuation(paths, run_id, base_sha.as_deref())?;
 
     let git_artifacts = write_git_artifacts(work_unit, paths, events, continuation.as_ref())?;
@@ -2080,6 +2080,184 @@ mod tests {
         let readme = fs::read_to_string(paths_2.workspace_dir.join("README.md"))
             .expect("read README.md from run2 workspace");
         assert!(readme.contains("turn1"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn committed_turn_preserves_base_sha_and_emits_commit_artifacts() {
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+
+        let root =
+            std::env::temp_dir().join(format!("agentctl-commit-turn-{}", uuid::Uuid::new_v4()));
+        let source = root.join("source");
+        fs::create_dir_all(&source).expect("create source repo dir");
+
+        git(&source, &["init"]);
+        git(&source, &["config", "user.email", "test@example.com"]);
+        git(&source, &["config", "user.name", "test"]);
+        fs::write(source.join("README.md"), "base\n").expect("write file");
+        git(&source, &["add", "."]);
+        git(&source, &["commit", "-m", "init"]);
+        git(&source, &["branch", "-M", "main"]);
+
+        let base_out = Command::new("git")
+            .arg("-C")
+            .arg(&source)
+            .arg("rev-parse")
+            .arg("main")
+            .output()
+            .expect("rev-parse main");
+        assert!(base_out.status.success());
+        let source_base_sha = String::from_utf8_lossy(&base_out.stdout).trim().to_string();
+
+        let run_id = "commit-turn-1";
+        let paths = new_test_paths(&root.join("agentd"), run_id);
+        let mut events =
+            EventWriter::new(run_id.to_string(), paths.events_norm.clone()).expect("events");
+        let mut wu = minimal_work_unit();
+        wu.target.repo = source.to_string_lossy().to_string();
+        wu.target.base_ref = "main".to_string();
+        wu.target.workspace_mode = WorkspaceMode::Worktree;
+        wu.acceptance.commands = vec![
+            "git config user.email test@example.com".to_string(),
+            "git config user.name test".to_string(),
+            "printf 'commit-turn\\n' >> README.md".to_string(),
+            "git add README.md".to_string(),
+            "git commit -m 'agent change'".to_string(),
+        ];
+        let spec = Spec {
+            path: "commit-turn.json".to_string(),
+            hash: "hash-commit-turn".to_string(),
+            snapshot_path: None,
+        };
+
+        let out = execute(&wu, run_id, &spec, &paths, &mut events).expect("run succeeds");
+        assert_eq!(out.status, RunStatus::Ok);
+
+        let run_json = fs::read(paths.run_dir.join("RUN.json")).expect("read RUN.json");
+        let run_record: Value = serde_json::from_slice(&run_json).expect("parse RUN.json");
+
+        let base_sha = run_record["workspace"]["base_sha"]
+            .as_str()
+            .expect("base_sha")
+            .to_string();
+        let final_sha = run_record["workspace"]["final_sha"]
+            .as_str()
+            .expect("final_sha")
+            .to_string();
+        assert_eq!(base_sha, source_base_sha);
+        assert_ne!(final_sha, base_sha);
+
+        let diff_patch =
+            fs::read_to_string(paths.artifacts_dir.join("diff.patch")).expect("read diff.patch");
+        assert!(
+            diff_patch.contains("+commit-turn"),
+            "diff.patch should include committed addition"
+        );
+
+        let commits: Vec<Value> = serde_json::from_slice(
+            &fs::read(paths.artifacts_dir.join("commits.json")).expect("read commits"),
+        )
+        .expect("parse commits");
+        assert_eq!(commits.len(), 1, "expected one agent commit");
+        let commit_sha = commits[0]["sha"].as_str().expect("commit sha");
+        assert_eq!(
+            commit_sha, final_sha,
+            "clean committed turn should end at commit sha"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clone_mode_committed_turn_preserves_base_sha_and_artifacts() {
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+
+        let root =
+            std::env::temp_dir().join(format!("agentctl-clone-turn-{}", uuid::Uuid::new_v4()));
+        let source = root.join("source");
+        fs::create_dir_all(&source).expect("create source repo dir");
+
+        git(&source, &["init"]);
+        git(&source, &["config", "user.email", "test@example.com"]);
+        git(&source, &["config", "user.name", "test"]);
+        fs::write(source.join("README.md"), "base\n").expect("write file");
+        git(&source, &["add", "."]);
+        git(&source, &["commit", "-m", "init"]);
+        git(&source, &["branch", "-M", "main"]);
+
+        let base_out = Command::new("git")
+            .arg("-C")
+            .arg(&source)
+            .arg("rev-parse")
+            .arg("main")
+            .output()
+            .expect("rev-parse main");
+        assert!(base_out.status.success());
+        let source_base_sha = String::from_utf8_lossy(&base_out.stdout).trim().to_string();
+
+        let run_id = "clone-turn-1";
+        let paths = new_test_paths(&root.join("agentd"), run_id);
+        let mut events =
+            EventWriter::new(run_id.to_string(), paths.events_norm.clone()).expect("events");
+        let mut wu = minimal_work_unit();
+        wu.target.repo = source.to_string_lossy().to_string();
+        wu.target.base_ref = "main".to_string();
+        wu.target.workspace_mode = WorkspaceMode::Clone;
+        wu.acceptance.commands = vec![
+            "git config user.email test@example.com".to_string(),
+            "git config user.name test".to_string(),
+            "printf 'clone-turn\\n' >> README.md".to_string(),
+            "git add README.md".to_string(),
+            "git commit -m 'agent clone change'".to_string(),
+        ];
+        let spec = Spec {
+            path: "clone-turn.json".to_string(),
+            hash: "hash-clone-turn".to_string(),
+            snapshot_path: None,
+        };
+
+        let out = execute(&wu, run_id, &spec, &paths, &mut events).expect("run succeeds");
+        assert_eq!(out.status, RunStatus::Ok);
+
+        let run_json = fs::read(paths.run_dir.join("RUN.json")).expect("read RUN.json");
+        let run_record: Value = serde_json::from_slice(&run_json).expect("parse RUN.json");
+
+        let mode = run_record["workspace"]["mode"]
+            .as_str()
+            .expect("workspace mode");
+        assert_eq!(mode, "clone");
+        let base_sha = run_record["workspace"]["base_sha"]
+            .as_str()
+            .expect("base_sha")
+            .to_string();
+        let final_sha = run_record["workspace"]["final_sha"]
+            .as_str()
+            .expect("final_sha")
+            .to_string();
+        assert_eq!(base_sha, source_base_sha);
+        assert_ne!(final_sha, base_sha);
+
+        let diff_patch =
+            fs::read_to_string(paths.artifacts_dir.join("diff.patch")).expect("read diff.patch");
+        assert!(
+            diff_patch.contains("+clone-turn"),
+            "diff.patch should include committed clone addition"
+        );
+
+        let commits: Vec<Value> = serde_json::from_slice(
+            &fs::read(paths.artifacts_dir.join("commits.json")).expect("read commits"),
+        )
+        .expect("parse commits");
+        assert_eq!(commits.len(), 1, "expected one agent commit in clone mode");
+        let commit_sha = commits[0]["sha"].as_str().expect("commit sha");
+        assert_eq!(
+            commit_sha, final_sha,
+            "clean committed clone turn should end at commit sha"
+        );
     }
 
     #[test]

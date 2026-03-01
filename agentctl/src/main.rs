@@ -17,7 +17,7 @@ use anyhow::{Context, Result};
 use artifacts::Spec;
 use clap::{Parser, Subcommand};
 use events::EventWriter;
-use run_dir::provision;
+use run_dir::{provision, provision_at};
 use runner::execute;
 use serde::Deserialize;
 use work_unit::WorkUnit;
@@ -84,6 +84,27 @@ fn run_spec(spec_path: &Path, json_output: bool) -> Result<i32> {
         .read_to_end(&mut buf)?;
 
     let work_unit_value = parse_work_unit_value(spec_path, &buf)?;
+    run_work_unit_value(
+        spec_path.display().to_string(),
+        work_unit_value,
+        &buf,
+        json_output,
+        false,
+        None,
+    )
+}
+
+fn run_work_unit_value(
+    spec_origin_path: String,
+    mut work_unit_value: serde_json::Value,
+    spec_hash_source: &[u8],
+    json_output: bool,
+    force_new_run_id: bool,
+    root_override: Option<&Path>,
+) -> Result<i32> {
+    if force_new_run_id {
+        strip_work_unit_id(&mut work_unit_value);
+    }
     schema::validate_work_unit(&work_unit_value)?;
     let normalized_work_unit = serde_json::to_vec_pretty(&work_unit_value)
         .context("failed to serialize normalized WorkUnit snapshot")?;
@@ -93,12 +114,28 @@ fn run_spec(spec_path: &Path, json_output: bool) -> Result<i32> {
     let spec_hash = {
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
-        hasher.update(&buf);
+        if force_new_run_id {
+            hasher.update(&normalized_work_unit);
+        } else {
+            hasher.update(spec_hash_source);
+        }
         hex::encode(hasher.finalize())
     };
 
-    let run_id = work_unit.id.clone().unwrap_or_else(run_id::new_run_id);
-    let paths = provision(&run_id, work_unit.target.workspace_mode)?;
+    let run_id = if force_new_run_id {
+        run_id::new_run_id()
+    } else if let Some(id) = work_unit.id.clone() {
+        run_id::validate_user_supplied(&id)?;
+        id
+    } else {
+        run_id::new_run_id()
+    };
+
+    let paths = if let Some(root) = root_override {
+        provision_at(root.to_path_buf(), &run_id, work_unit.target.workspace_mode)?
+    } else {
+        provision(&run_id, work_unit.target.workspace_mode)?
+    };
     let spec_snapshot_rel = "spec/work_unit.json".to_string();
     let spec_snapshot_path = paths.run_dir.join(&spec_snapshot_rel);
     if let Some(parent) = spec_snapshot_path.parent() {
@@ -118,7 +155,7 @@ fn run_spec(spec_path: &Path, json_output: bool) -> Result<i32> {
     )?;
 
     let spec = Spec {
-        path: spec_path.display().to_string(),
+        path: spec_origin_path,
         hash: spec_hash,
         snapshot_path: Some(spec_snapshot_rel),
     };
@@ -203,7 +240,17 @@ fn rerun(run_id: &str) -> Result<i32> {
             spec_path.display()
         );
     }
-    run_spec(&spec_path, false)
+    let spec_bytes =
+        fs::read(&spec_path).with_context(|| format!("failed to read {}", spec_path.display()))?;
+    let work_unit_value = parse_work_unit_value(&spec_path, &spec_bytes)?;
+    run_work_unit_value(
+        spec_path.display().to_string(),
+        work_unit_value,
+        &spec_bytes,
+        false,
+        true,
+        None,
+    )
 }
 
 fn resolve_rerun_spec_path(run_dir: &Path, spec: &RunSpecPath) -> PathBuf {
@@ -224,6 +271,12 @@ fn parse_work_unit_value(path: &Path, bytes: &[u8]) -> Result<serde_json::Value>
         serde_json::to_value(toml_value).context("failed to convert TOML WorkUnit into JSON value")
     } else {
         serde_json::from_slice(bytes).context("failed to parse WorkUnit JSON")
+    }
+}
+
+fn strip_work_unit_id(value: &mut serde_json::Value) {
+    if let Some(obj) = value.as_object_mut() {
+        obj.remove("id");
     }
 }
 
@@ -250,6 +303,7 @@ struct RunSpecPath {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
 
     #[test]
     fn rerun_uses_relative_snapshot_path_when_present() {
@@ -282,5 +336,70 @@ mod tests {
         };
         let resolved = resolve_rerun_spec_path(&run_dir, &spec);
         assert_eq!(resolved, PathBuf::from("/old/spec.json"));
+    }
+
+    #[test]
+    fn strip_work_unit_id_removes_id_field() {
+        let mut value = serde_json::json!({
+            "version": "runfmt/0.1",
+            "id": "abc-123"
+        });
+        strip_work_unit_id(&mut value);
+        assert!(value.get("id").is_none());
+    }
+
+    #[test]
+    fn rerun_mode_generates_fresh_run_and_preserves_original_bundle() {
+        let root = std::env::temp_dir().join(format!("agentctl-rerun-{}", uuid::Uuid::new_v4()));
+        let mut spec: Value =
+            serde_json::from_str(include_str!("../runfmt-example.json")).expect("valid sample");
+        spec["id"] = Value::String("stable-run-id".to_string());
+        let raw = serde_json::to_vec_pretty(&spec).expect("serialize spec");
+
+        let first = run_work_unit_value(
+            "inline-spec.json".to_string(),
+            spec.clone(),
+            &raw,
+            false,
+            false,
+            Some(&root),
+        )
+        .expect("first run succeeds");
+        assert_eq!(first, 0);
+
+        let first_run_json_path = root.join("runs").join("stable-run-id").join("RUN.json");
+        let first_run_json = fs::read(&first_run_json_path).expect("read first RUN.json");
+
+        let replay = run_work_unit_value(
+            "inline-spec.json".to_string(),
+            spec,
+            &raw,
+            false,
+            true,
+            Some(&root),
+        )
+        .expect("rerun succeeds");
+        assert_eq!(replay, 0);
+
+        let runs_dir = root.join("runs");
+        let run_names = fs::read_dir(&runs_dir)
+            .expect("read runs dir")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(run_names.len(), 2);
+        assert!(run_names.iter().any(|name| name == "stable-run-id"));
+
+        let first_run_json_after =
+            fs::read(&first_run_json_path).expect("read first RUN.json again");
+        assert_eq!(
+            first_run_json, first_run_json_after,
+            "original run bundle must remain unchanged"
+        );
     }
 }

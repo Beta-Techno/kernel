@@ -63,6 +63,8 @@ To continue code state exactly across turns:
 
 Do not rely on `workspace.branch` as the authoritative continuation point when prior runs can end with uncommitted changes.
 
+Current guarantee scope: exact continuation is guaranteed for runs chained under the same `AGENTD_ROOT` using `workspace_mode = "worktree"`. Clone-mode continuation may require additional object/ref import logic and should be treated as best-effort until explicitly hardened.
+
 ## Artifacts
 
 Wrappers should consume:

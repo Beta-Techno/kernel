@@ -18,8 +18,15 @@ pub struct RunPaths {
     pub worktrees_dir: PathBuf,
 }
 
-pub fn provision(run_id: &str, _workspace_mode: WorkspaceMode) -> Result<RunPaths> {
-    let root = root();
+pub fn provision(run_id: &str, workspace_mode: WorkspaceMode) -> Result<RunPaths> {
+    provision_at(root(), run_id, workspace_mode)
+}
+
+pub(crate) fn provision_at(
+    root: PathBuf,
+    run_id: &str,
+    _workspace_mode: WorkspaceMode,
+) -> Result<RunPaths> {
     let runs_dir = root.join("runs");
     let worktrees_dir = root.join("worktrees");
     let repos_dir = root.join("repos");
@@ -35,11 +42,21 @@ pub fn provision(run_id: &str, _workspace_mode: WorkspaceMode) -> Result<RunPath
     let receipts_dir = run_dir.join("receipts");
     let workspace_dir = worktrees_dir.join(run_id);
 
-    for dir in [&run_dir, &logs_dir, &artifacts_dir, &receipts_dir] {
-        ensure_dir(dir)?;
+    ensure_new_dir(&run_dir)
+        .with_context(|| format!("run id already exists or cannot be created: {}", run_id))?;
+    if let Err(err) = ensure_new_dir(&workspace_dir) {
+        let _ = fs::remove_dir_all(&run_dir);
+        return Err(err).with_context(|| {
+            format!(
+                "workspace for run id already exists or cannot be created: {}",
+                run_id
+            )
+        });
     }
 
-    ensure_dir(&workspace_dir)?;
+    for dir in [&logs_dir, &artifacts_dir, &receipts_dir] {
+        ensure_dir(dir)?;
+    }
 
     let events_raw = run_dir.join("events.raw.jsonl");
     let events_norm = run_dir.join("events.norm.jsonl");
@@ -85,6 +102,17 @@ fn ensure_dir(path: &PathBuf) -> Result<()> {
     Ok(())
 }
 
+fn ensure_new_dir(path: &PathBuf) -> Result<()> {
+    fs::create_dir(path).with_context(|| format!("failed to create new dir {:?}", path))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = fs::Permissions::from_mode(0o700);
+        fs::set_permissions(path, perms)?;
+    }
+    Ok(())
+}
+
 fn ensure_file(path: &PathBuf) -> Result<()> {
     File::create(path).with_context(|| format!("failed to create file {:?}", path))?;
     #[cfg(unix)]
@@ -94,4 +122,22 @@ fn ensure_file(path: &PathBuf) -> Result<()> {
         fs::set_permissions(path, perms)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_duplicate_run_id() {
+        let root = std::env::temp_dir().join(format!("agentd-run-dir-{}", uuid::Uuid::new_v4()));
+        let first = provision_at(root.clone(), "dup-run", WorkspaceMode::Scratch);
+        assert!(first.is_ok(), "first provision should succeed");
+
+        let second = provision_at(root, "dup-run", WorkspaceMode::Scratch);
+        assert!(
+            second.is_err(),
+            "second provision with same run_id must fail"
+        );
+    }
 }
