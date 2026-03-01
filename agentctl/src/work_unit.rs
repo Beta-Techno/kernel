@@ -1,12 +1,13 @@
 use std::collections::HashMap;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 #[derive(Debug, Deserialize)]
 pub struct WorkUnit {
     pub version: String,
     pub id: Option<String>,
+    pub lineage: Option<Lineage>,
     pub kind: String,
     pub target: Target,
     pub agent: Agent,
@@ -16,6 +17,14 @@ pub struct WorkUnit {
     pub budgets: Budgets,
     pub acceptance: Acceptance,
     pub outputs: Outputs,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Lineage {
+    pub workflow_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_run_id: Option<String>,
+    pub agent_id: String,
 }
 
 #[derive(Debug, Deserialize)]

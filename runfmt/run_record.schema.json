@@ -30,6 +30,34 @@
     },
     "version": {"type": "string", "const": "runfmt/0.1"},
     "kind": {"type": "string", "enum": ["code_pr", "ops", "hybrid"]},
+    "lineage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["workflow_id", "agent_id"],
+      "properties": {
+        "workflow_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9._-]+$",
+          "not": {"enum": [".", ".."]}
+        },
+        "parent_run_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9._-]+$",
+          "not": {"enum": [".", ".."]}
+        },
+        "agent_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9._-]+$",
+          "not": {"enum": [".", ".."]}
+        }
+      }
+    },
     "status": {"type": "string", "enum": ["ok", "failed", "needs_human"]},
     "driver": {"type": "string"},
     "agent_session_id": {"type": ["string", "null"]},

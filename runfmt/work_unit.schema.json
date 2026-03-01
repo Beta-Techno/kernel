@@ -23,11 +23,42 @@
     },
     "id": {
       "type": "string",
-      "description": "Optional run identifier. Must be filesystem-safe for runs/<id>/ and worktrees/<id>/ paths.",
+      "description": "Optional run attempt identifier. Must be filesystem-safe for runs/<id>/ and worktrees/<id>/ paths.",
       "minLength": 1,
       "maxLength": 128,
       "pattern": "^[A-Za-z0-9._-]+$",
       "not": {"enum": [".", ".."]}
+    },
+    "lineage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["workflow_id", "agent_id"],
+      "properties": {
+        "workflow_id": {
+          "type": "string",
+          "description": "Stable orchestrator workflow identity.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9._-]+$",
+          "not": {"enum": [".", ".."]}
+        },
+        "parent_run_id": {
+          "type": "string",
+          "description": "Immediate predecessor run in the workflow chain.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9._-]+$",
+          "not": {"enum": [".", ".."]}
+        },
+        "agent_id": {
+          "type": "string",
+          "description": "Stable logical actor identity within the workflow.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9._-]+$",
+          "not": {"enum": [".", ".."]}
+        }
+      }
     },
     "kind": {
       "type": "string",

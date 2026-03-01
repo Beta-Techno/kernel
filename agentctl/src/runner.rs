@@ -241,6 +241,7 @@ pub fn execute(
         run_id: run_id.to_string(),
         version: "runfmt/0.1",
         kind: work_unit.kind.clone(),
+        lineage: work_unit.lineage.clone(),
         status: final_status.as_run_record_status().to_string(),
         driver: work_unit.agent.driver.clone(),
         agent_session_id: agent.session_id.clone(),
@@ -2261,6 +2262,46 @@ mod tests {
     }
 
     #[test]
+    fn run_record_persists_lineage_fields() {
+        let root =
+            std::env::temp_dir().join(format!("agentctl-lineage-turn-{}", uuid::Uuid::new_v4()));
+        let run_id = "lineage-turn-1";
+        let paths = new_test_paths(&root.join("agentd"), run_id);
+        let mut events =
+            EventWriter::new(run_id.to_string(), paths.events_norm.clone()).expect("events");
+        let mut wu = minimal_work_unit();
+        wu.lineage = Some(crate::work_unit::Lineage {
+            workflow_id: "wf-123".to_string(),
+            parent_run_id: Some("prev-456".to_string()),
+            agent_id: "coder".to_string(),
+        });
+        let spec = Spec {
+            path: "lineage-turn.json".to_string(),
+            hash: "hash-lineage-turn".to_string(),
+            snapshot_path: None,
+        };
+
+        let out = execute(&wu, run_id, &spec, &paths, &mut events).expect("run succeeds");
+        assert_eq!(out.status, RunStatus::Ok);
+
+        let run_json = fs::read(paths.run_dir.join("RUN.json")).expect("read RUN.json");
+        let run_record: Value = serde_json::from_slice(&run_json).expect("parse RUN.json");
+        let lineage = run_record["lineage"].as_object().expect("lineage object");
+        assert_eq!(
+            lineage.get("workflow_id").and_then(Value::as_str),
+            Some("wf-123")
+        );
+        assert_eq!(
+            lineage.get("parent_run_id").and_then(Value::as_str),
+            Some("prev-456")
+        );
+        assert_eq!(
+            lineage.get("agent_id").and_then(Value::as_str),
+            Some("coder")
+        );
+    }
+
+    #[test]
     fn codex_exec_early_budget_still_writes_agent_final_artifact() {
         let root = std::env::temp_dir().join(format!(
             "agentctl-agent-final-budget-{}",
@@ -2290,6 +2331,7 @@ mod tests {
         WorkUnit {
             version: "runfmt/0.1".to_string(),
             id: None,
+            lineage: None,
             kind: "code_pr".to_string(),
             target: Target {
                 repo: ".".to_string(),

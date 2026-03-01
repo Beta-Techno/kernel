@@ -47,6 +47,11 @@ Skipped artifacts are recorded in `events.norm.jsonl` as `artifact.skipped`.
   "run_id": "01J0EXAMPLE",
   "version": "runfmt/0.1",
   "kind": "code_pr",
+  "lineage": {
+    "workflow_id": "wf-123",
+    "parent_run_id": "01J0PARENT",
+    "agent_id": "coder"
+  },
   "status": "ok | failed | needs_human",
   "driver": "noop | codex_exec | ...",
   "agent_session_id": "thread_...",
@@ -88,6 +93,7 @@ Skipped artifacts are recorded in `events.norm.jsonl` as `artifact.skipped`.
 `workspace.final_sha` is the exact commit representing the final workspace state. If the run ends dirty/untracked, kernel creates a synthetic snapshot commit and records it here.
 `workspace.continuation_ref` is a kernel-managed ref pointing at `workspace.final_sha` so the snapshot remains reachable.
 For continuation, set next run `target.base_ref` to the prior `workspace.final_sha`.
+`lineage.workflow_id` is the stable workflow identity; `run_id` remains the per-attempt run bundle id.
 Exact continuation is guaranteed for runs chained under the same `AGENTD_ROOT` with `workspace_mode = "worktree"`. Clone-mode continuation should be treated as best-effort until object/ref import is explicitly implemented.
 `artifacts/commits.json` includes agent-created commits only; kernel synthetic snapshot commits are excluded.
 `spec.snapshot_path` points to the normalized submitted WorkUnit snapshot inside the run bundle. `agentctl rerun <run_id>` should use this snapshot first.

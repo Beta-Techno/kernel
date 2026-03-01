@@ -68,4 +68,16 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn accepts_lineage_metadata() {
+        let mut sample: Value =
+            serde_json::from_str(include_str!("../runfmt-example.json")).expect("valid sample");
+        sample["lineage"] = serde_json::json!({
+            "workflow_id": "wf-123",
+            "parent_run_id": "run-122",
+            "agent_id": "coder"
+        });
+        validate_work_unit(&sample).expect("lineage metadata should validate");
+    }
 }

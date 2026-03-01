@@ -7,12 +7,15 @@ use serde::Serialize;
 
 use crate::run_id;
 use crate::schema;
+use crate::work_unit::Lineage;
 
 #[derive(Serialize)]
 pub struct RunRecord {
     pub run_id: String,
     pub version: &'static str,
     pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lineage: Option<Lineage>,
     pub status: String,
     pub driver: String,
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -15,7 +15,7 @@ agentctl run --spec /path/to/work-unit.json --json
 
 ```json
 {
-  "run_id": "conductor-smoke-001",
+  "run_id": "01JEXAMPLE2NN4Y8C9K3V0Q5M",
   "status": "ok|failed|needs_human",
   "exit_code": 0,
   "run_dir": "/var/lib/agentd/runs/conductor-smoke-001",
@@ -31,11 +31,14 @@ run <run_id> completed with status <ok|failed|needs_human>
 
 ## Run ID Rules
 
-Conductor should always provide `work_unit.id` and treat it as the authoritative job attempt id.
+`work_unit.id` is the per-attempt bundle id. Conductor should usually omit it and let kernel generate a fresh run id.
 
-- length `1..128`
-- characters `[A-Za-z0-9._-]`
-- not `"."` and not `".."`
+Use `lineage.workflow_id` as the durable workflow identity and `lineage.parent_run_id` to link attempts.
+
+- `work_unit.id` rules when supplied:
+  - length `1..128`
+  - characters `[A-Za-z0-9._-]`
+  - not `"."` and not `".."`
 
 If `work_unit.id` is omitted, kernel generates a UUID.
 
@@ -60,8 +63,12 @@ For git-backed runs, `RUN.json.workspace` includes:
 To continue code state exactly across turns:
 
 - set next run `target.base_ref = previous RUN.json.workspace.final_sha`
+- set next run `lineage.parent_run_id = previous RUN.json.run_id`
+- preserve `lineage.workflow_id` across all turns in one workflow
 
 Do not rely on `workspace.branch` as the authoritative continuation point when prior runs can end with uncommitted changes.
+
+For same-agent continuation, set next run `agent.resume_session_id = previous RUN.json.agent_session_id` when present.
 
 Current guarantee scope: exact continuation is guaranteed for runs chained under the same `AGENTD_ROOT` using `workspace_mode = "worktree"`. Clone-mode continuation may require additional object/ref import logic and should be treated as best-effort until explicitly hardened.
 

@@ -27,6 +27,7 @@ pub(crate) fn provision_at(
     run_id: &str,
     _workspace_mode: WorkspaceMode,
 ) -> Result<RunPaths> {
+    let root = absolutize_path(root);
     let runs_dir = root.join("runs");
     let worktrees_dir = root.join("worktrees");
     let repos_dir = root.join("repos");
@@ -79,16 +80,28 @@ pub(crate) fn provision_at(
 
 pub fn root() -> PathBuf {
     if let Ok(root) = std::env::var("AGENTD_ROOT") {
-        return PathBuf::from(root);
+        return absolutize_path(PathBuf::from(root));
     }
 
     if let Some(dir) = dirs::data_dir() {
-        return dir.join("agentd");
+        return absolutize_path(dir.join("agentd"));
     }
 
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("agentd")
+    absolutize_path(
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("agentd"),
+    )
+}
+
+fn absolutize_path(path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        return path;
+    }
+    match std::env::current_dir() {
+        Ok(cwd) => cwd.join(path),
+        Err(_) => path,
+    }
 }
 
 fn ensure_dir(path: &PathBuf) -> Result<()> {
