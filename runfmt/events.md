@@ -25,7 +25,7 @@ Events are append-only. New event types may be added in backwards-compatible way
 | `agent.stderr` | `{ "chunk": "base64" }` |
 | `agent.exited` | `{ "exit_code": 0, "reason": "completed" }` |
 | `run.interrupted` | `{ "reason": "operator", "signal": "SIGTERM" }` |
-| `run.finished` | `{ "status": "ok|failed|canceled", "summary_ref": "RUN.json" }` |
+| `run.finished` | `{ "status": "ok|failed|needs_human", "summary_ref": "RUN.json" }` |
 | `artifact.skipped` | `{ "artifact": "artifacts/diff.patch", "reason": "outputs.want_patch=false" }` |
 
 ## Policy & Budgets

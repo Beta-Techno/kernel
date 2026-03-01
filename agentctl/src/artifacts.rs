@@ -39,6 +39,9 @@ pub struct Workspace {
     pub path: String,
     pub branch: Option<String>,
     pub base_ref: Option<String>,
+    pub base_sha: Option<String>,
+    pub final_sha: Option<String>,
+    pub continuation_ref: Option<String>,
 }
 
 #[derive(Serialize)]

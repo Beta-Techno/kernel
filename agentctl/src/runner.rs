@@ -39,9 +39,16 @@ struct GitArtifacts {
     bytes_written: u64,
 }
 
+struct WorkspaceContinuation {
+    base_sha: String,
+    agent_head_sha: String,
+    final_sha: String,
+    continuation_ref: String,
+    status: StatusSummary,
+}
+
 struct StatusSummary {
     changed_files: Vec<String>,
-    untracked_files: Vec<String>,
     tracked_count: usize,
     untracked_count: usize,
 }
@@ -81,7 +88,7 @@ impl RunStatus {
         match self {
             RunStatus::Ok => "ok",
             RunStatus::Failed => "failed",
-            RunStatus::NeedsHuman => "canceled",
+            RunStatus::NeedsHuman => "needs_human",
         }
     }
 }
@@ -186,8 +193,11 @@ pub fn execute(
         final_status = RunStatus::Failed;
     }
 
-    let git_artifacts = write_git_artifacts(work_unit, paths, events)?;
-    write_commits_artifact(work_unit, paths, events)?;
+    let base_sha = workspace_base_sha(work_unit, paths)?;
+    let continuation = resolve_workspace_continuation(paths, run_id, base_sha.as_deref())?;
+
+    let git_artifacts = write_git_artifacts(work_unit, paths, events, continuation.as_ref())?;
+    write_commits_artifact(work_unit, paths, events, continuation.as_ref())?;
     if enforce_budget_limit(
         events,
         "max_diff_lines",
@@ -242,6 +252,9 @@ pub fn execute(
             path: paths.workspace_dir.display().to_string(),
             branch,
             base_ref: Some(work_unit.target.base_ref.clone()),
+            base_sha: continuation.as_ref().map(|c| c.base_sha.clone()),
+            final_sha: continuation.as_ref().map(|c| c.final_sha.clone()),
+            continuation_ref: continuation.as_ref().map(|c| c.continuation_ref.clone()),
         },
         budgets_used: BudgetsUsed {
             wall_seconds,
@@ -601,17 +614,119 @@ fn emit_skipped_validation(events: &mut EventWriter) -> Result<()> {
     Ok(())
 }
 
+fn workspace_base_sha(work_unit: &WorkUnit, paths: &RunPaths) -> Result<Option<String>> {
+    if work_unit.target.workspace_mode == WorkspaceMode::Scratch
+        || !is_git_repo_root(&paths.workspace_dir)
+    {
+        return Ok(None);
+    }
+    Ok(Some(git_head_sha(&paths.workspace_dir)?))
+}
+
+fn resolve_workspace_continuation(
+    paths: &RunPaths,
+    run_id: &str,
+    base_sha: Option<&str>,
+) -> Result<Option<WorkspaceContinuation>> {
+    let Some(base_sha) = base_sha else {
+        return Ok(None);
+    };
+    if !is_git_repo_root(&paths.workspace_dir) {
+        return Ok(None);
+    }
+
+    let status_output = git_capture(&paths.workspace_dir, ["status", "--porcelain"])?;
+    let status = parse_status_summary(&status_output.stdout);
+    let agent_head_sha = git_head_sha(&paths.workspace_dir)?;
+
+    let final_sha = if status.changed_files.is_empty() {
+        agent_head_sha.clone()
+    } else {
+        create_snapshot_commit(&paths.workspace_dir, run_id, &agent_head_sha)?
+    };
+
+    let continuation_ref = format!("refs/agentctl/continuations/{run_id}");
+    update_git_ref(&paths.workspace_dir, &continuation_ref, &final_sha)?;
+
+    Ok(Some(WorkspaceContinuation {
+        base_sha: base_sha.to_string(),
+        agent_head_sha,
+        final_sha,
+        continuation_ref,
+        status,
+    }))
+}
+
+fn git_head_sha(workspace_dir: &Path) -> Result<String> {
+    let out = git_capture(workspace_dir, ["rev-parse", "HEAD"])?;
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if sha.is_empty() {
+        bail!("git rev-parse HEAD returned empty output");
+    }
+    Ok(sha)
+}
+
+fn create_snapshot_commit(workspace_dir: &Path, run_id: &str, parent_sha: &str) -> Result<String> {
+    git_ok(workspace_dir, ["add", "-A"])?;
+
+    let tree_output = git_capture(workspace_dir, ["write-tree"])?;
+    let tree_sha = String::from_utf8_lossy(&tree_output.stdout)
+        .trim()
+        .to_string();
+    if tree_sha.is_empty() {
+        bail!("git write-tree returned empty output");
+    }
+
+    let message = format!("kernel snapshot for run {run_id}");
+    let mut cmd = Command::new("git");
+    cmd.arg("-C")
+        .arg(workspace_dir)
+        .arg("commit-tree")
+        .arg(&tree_sha)
+        .arg("-p")
+        .arg(parent_sha)
+        .arg("-m")
+        .arg(&message)
+        .env("GIT_AUTHOR_NAME", "agentctl-kernel")
+        .env("GIT_AUTHOR_EMAIL", "agentctl-kernel@local")
+        .env("GIT_COMMITTER_NAME", "agentctl-kernel")
+        .env("GIT_COMMITTER_EMAIL", "agentctl-kernel@local");
+
+    let output = command_capture(&mut cmd, "git commit-tree")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git commit-tree failed: {stderr}");
+    }
+
+    git_ok(workspace_dir, ["reset", "--mixed"])?;
+
+    let commit_sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if commit_sha.is_empty() {
+        bail!("git commit-tree returned empty output");
+    }
+    Ok(commit_sha)
+}
+
+fn update_git_ref(workspace_dir: &Path, ref_name: &str, sha: &str) -> Result<()> {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C")
+        .arg(workspace_dir)
+        .arg("update-ref")
+        .arg(ref_name)
+        .arg(sha);
+    command_ok(&mut cmd, "git update-ref")
+}
+
 fn write_git_artifacts(
     work_unit: &WorkUnit,
     paths: &RunPaths,
     events: &mut EventWriter,
+    continuation: Option<&WorkspaceContinuation>,
 ) -> Result<GitArtifacts> {
     let diff_path = paths.artifacts_dir.join("diff.patch");
     let changed_files_path = paths.artifacts_dir.join("changed_files.json");
 
-    if work_unit.target.workspace_mode == WorkspaceMode::Scratch
-        || !is_git_repo_root(&paths.workspace_dir)
-    {
+    let Some(continuation) = continuation else {
         fs::write(diff_path, [])?;
         fs::write(changed_files_path, b"[]\n")?;
         return Ok(GitArtifacts {
@@ -619,11 +734,15 @@ fn write_git_artifacts(
             diff_lines: 0,
             bytes_written: 0,
         });
-    }
+    };
 
+    let diff_range = format!("{}..{}", continuation.base_sha, continuation.final_sha);
     if work_unit.outputs.want_patch {
-        let diff = git_capture(&paths.workspace_dir, ["diff", "--binary"])
-            .context("failed to compute git diff for artifact")?;
+        let diff = git_capture(
+            &paths.workspace_dir,
+            ["diff", "--binary", diff_range.as_str()],
+        )
+        .context("failed to compute git diff for artifact")?;
         fs::write(&diff_path, &diff.stdout)?;
     } else {
         fs::write(&diff_path, [])?;
@@ -636,40 +755,43 @@ fn write_git_artifacts(
         )?;
     }
 
-    let status = git_capture(&paths.workspace_dir, ["status", "--porcelain"])?;
-    let summary = parse_status_summary(&status.stdout);
     events.emit(
         "git.status",
         &serde_json::json!({
-            "clean": summary.changed_files.is_empty(),
-            "tracked": summary.tracked_count,
-            "untracked": summary.untracked_count,
+            "clean": continuation.status.changed_files.is_empty(),
+            "tracked": continuation.status.tracked_count,
+            "untracked": continuation.status.untracked_count,
         }),
     )?;
 
-    let numstat = git_capture(&paths.workspace_dir, ["diff", "--numstat"])?;
+    let name_only = git_capture(
+        &paths.workspace_dir,
+        ["diff", "--name-only", diff_range.as_str()],
+    )?;
+    let changed_files = parse_name_only_paths(&name_only.stdout);
+
+    let numstat = git_capture(
+        &paths.workspace_dir,
+        ["diff", "--numstat", diff_range.as_str()],
+    )?;
     let (files, insertions, deletions) = parse_numstat(&numstat.stdout);
-    let untracked_lines = sum_file_lines(&paths.workspace_dir, &summary.untracked_files);
-    let diff_lines = insertions
-        .saturating_add(deletions)
-        .saturating_add(untracked_lines);
-    let bytes_written =
-        emit_file_write_events(&paths.workspace_dir, &summary.changed_files, events)?;
+    let diff_lines = insertions.saturating_add(deletions);
+    let bytes_written = emit_file_write_events(&paths.workspace_dir, &changed_files, events)?;
     events.emit(
         "git.diff.stats",
         &serde_json::json!({
-            "files": std::cmp::max(files, summary.changed_files.len()),
+            "files": std::cmp::max(files, changed_files.len()),
             "insertions": insertions,
             "deletions": deletions,
             "diff_lines": diff_lines,
         }),
     )?;
 
-    let json = serde_json::to_vec_pretty(&summary.changed_files)?;
+    let json = serde_json::to_vec_pretty(&changed_files)?;
     fs::write(changed_files_path, json)?;
 
     Ok(GitArtifacts {
-        changed_files: summary.changed_files,
+        changed_files,
         diff_lines,
         bytes_written,
     })
@@ -679,6 +801,7 @@ fn write_commits_artifact(
     work_unit: &WorkUnit,
     paths: &RunPaths,
     events: &mut EventWriter,
+    continuation: Option<&WorkspaceContinuation>,
 ) -> Result<()> {
     let commits_path = paths.artifacts_dir.join("commits.json");
     if !work_unit.outputs.want_commits {
@@ -692,14 +815,12 @@ fn write_commits_artifact(
         )?;
         return Ok(());
     }
-    if work_unit.target.workspace_mode == WorkspaceMode::Scratch
-        || !is_git_repo_root(&paths.workspace_dir)
-    {
+    let Some(continuation) = continuation else {
         fs::write(&commits_path, b"[]\n")?;
         return Ok(());
-    }
+    };
 
-    let range = format!("{}..HEAD", work_unit.target.base_ref);
+    let range = format!("{}..{}", continuation.base_sha, continuation.agent_head_sha);
     let out = git_capture(
         &paths.workspace_dir,
         ["log", "--reverse", "--format=%H%x09%s", &range],
@@ -1353,7 +1474,6 @@ fn shell_preview(command: &str) -> Vec<String> {
 fn parse_status_summary(status_output: &[u8]) -> StatusSummary {
     let text = String::from_utf8_lossy(status_output);
     let mut changed_paths = BTreeSet::new();
-    let mut untracked_paths = BTreeSet::new();
     let mut tracked_count = 0_usize;
     let mut untracked_count = 0_usize;
 
@@ -1368,7 +1488,6 @@ fn parse_status_summary(status_output: &[u8]) -> StatusSummary {
         }
         if !path.is_empty() {
             if is_untracked {
-                untracked_paths.insert(path.clone());
                 untracked_count += 1;
             } else {
                 tracked_count += 1;
@@ -1379,55 +1498,11 @@ fn parse_status_summary(status_output: &[u8]) -> StatusSummary {
 
     StatusSummary {
         changed_files: changed_paths.into_iter().collect(),
-        untracked_files: untracked_paths.into_iter().collect(),
         tracked_count,
         untracked_count,
     }
 }
 
-fn append_untracked_file_diffs(
-    workspace_dir: &Path,
-    mut tracked_diff: Vec<u8>,
-    untracked_files: &[String],
-) -> Result<Vec<u8>> {
-    let null_path = if cfg!(windows) { "NUL" } else { "/dev/null" };
-
-    for rel_path in untracked_files {
-        let path = workspace_dir.join(rel_path);
-        let metadata = match fs::symlink_metadata(&path) {
-            Ok(meta) => meta,
-            Err(_) => continue,
-        };
-        if metadata.is_dir() {
-            continue;
-        }
-
-        let mut cmd = Command::new("git");
-        cmd.arg("-C")
-            .arg(workspace_dir)
-            .arg("-c")
-            .arg("core.quotePath=false")
-            .arg("diff")
-            .arg("--no-index")
-            .arg("--binary")
-            .arg("--")
-            .arg(null_path)
-            .arg(rel_path);
-        let output = command_capture(&mut cmd, "git diff --no-index")
-            .with_context(|| format!("failed to compute untracked diff for {rel_path}"))?;
-        match output.status.code() {
-            Some(0) | Some(1) => {
-                tracked_diff.extend_from_slice(&output.stdout);
-            }
-            _ => {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                bail!("git diff --no-index failed for {rel_path}: {stderr}");
-            }
-        }
-    }
-
-    Ok(tracked_diff)
-}
 fn parse_numstat(numstat_output: &[u8]) -> (usize, u64, u64) {
     let text = String::from_utf8_lossy(numstat_output);
     let mut files = 0_usize;
@@ -1453,12 +1528,16 @@ fn parse_numstat(numstat_output: &[u8]) -> (usize, u64, u64) {
     (files, insertions, deletions)
 }
 
-fn sum_file_lines(workspace_dir: &Path, rel_paths: &[String]) -> u64 {
-    rel_paths
-        .iter()
-        .filter_map(|rel| fs::read(workspace_dir.join(rel)).ok())
-        .map(|content| String::from_utf8_lossy(&content).lines().count() as u64)
-        .fold(0_u64, u64::saturating_add)
+fn parse_name_only_paths(stdout: &[u8]) -> Vec<String> {
+    let text = String::from_utf8_lossy(stdout);
+    let mut paths = BTreeSet::new();
+    for line in text.lines() {
+        let path = line.trim();
+        if !path.is_empty() {
+            paths.insert(path.to_string());
+        }
+    }
+    paths.into_iter().collect()
 }
 
 fn receipts_are_required(work_unit: &WorkUnit) -> bool {
@@ -1553,7 +1632,6 @@ mod tests {
             summary.changed_files,
             vec!["new.txt", "notes.md", "src/main.rs"]
         );
-        assert_eq!(summary.untracked_files, vec!["notes.md"]);
         assert_eq!(summary.tracked_count, 2);
         assert_eq!(summary.untracked_count, 1);
     }
@@ -1886,6 +1964,120 @@ mod tests {
             .status()
             .expect("git show-ref cached");
         assert!(cached_has_branch.success());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn two_turn_continuation_uses_final_sha_for_dirty_workspace() {
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "agentctl-continuation-two-turn-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let source = root.join("source");
+        fs::create_dir_all(&source).expect("create source repo dir");
+
+        git(&source, &["init"]);
+        git(&source, &["config", "user.email", "test@example.com"]);
+        git(&source, &["config", "user.name", "test"]);
+        fs::write(source.join("README.md"), "base\n").expect("write file");
+        git(&source, &["add", "."]);
+        git(&source, &["commit", "-m", "init"]);
+        git(&source, &["branch", "-M", "main"]);
+
+        let agentd_root = root.join("agentd");
+
+        let run_id_1 = "run-1";
+        let paths_1 = new_test_paths(&agentd_root, run_id_1);
+        let mut events_1 =
+            EventWriter::new(run_id_1.to_string(), paths_1.events_norm.clone()).expect("events");
+        let mut wu_1 = minimal_work_unit();
+        wu_1.target.repo = source.to_string_lossy().to_string();
+        wu_1.target.base_ref = "main".to_string();
+        wu_1.target.workspace_mode = WorkspaceMode::Worktree;
+        wu_1.acceptance.commands = vec!["printf 'turn1\\n' >> README.md".to_string()];
+        let spec_1 = Spec {
+            path: "run-1.json".to_string(),
+            hash: "hash-1".to_string(),
+        };
+
+        let out_1 = execute(&wu_1, run_id_1, &spec_1, &paths_1, &mut events_1).expect("run 1");
+        assert_eq!(out_1.status, RunStatus::Ok);
+
+        let run_1_json = fs::read(paths_1.run_dir.join("RUN.json")).expect("read run1 RUN.json");
+        let run_1: Value = serde_json::from_slice(&run_1_json).expect("parse run1 RUN.json");
+        let base_sha = run_1["workspace"]["base_sha"]
+            .as_str()
+            .expect("run1 base_sha")
+            .to_string();
+        let final_sha = run_1["workspace"]["final_sha"]
+            .as_str()
+            .expect("run1 final_sha")
+            .to_string();
+        let continuation_ref = run_1["workspace"]["continuation_ref"]
+            .as_str()
+            .expect("run1 continuation_ref")
+            .to_string();
+
+        assert_ne!(
+            base_sha, final_sha,
+            "dirty turn should produce snapshot final_sha"
+        );
+
+        let ref_out = Command::new("git")
+            .arg("-C")
+            .arg(&paths_1.workspace_dir)
+            .arg("rev-parse")
+            .arg(&continuation_ref)
+            .output()
+            .expect("rev-parse continuation ref");
+        assert!(
+            ref_out.status.success(),
+            "rev-parse failed: {}",
+            String::from_utf8_lossy(&ref_out.stderr)
+        );
+        let ref_sha = String::from_utf8_lossy(&ref_out.stdout).trim().to_string();
+        assert_eq!(ref_sha, final_sha);
+
+        let changed_files: Vec<String> = serde_json::from_slice(
+            &fs::read(paths_1.artifacts_dir.join("changed_files.json"))
+                .expect("read changed_files"),
+        )
+        .expect("parse changed_files");
+        assert!(
+            changed_files.iter().any(|path| path == "README.md"),
+            "changed_files should include README.md"
+        );
+        let diff_patch =
+            fs::read_to_string(paths_1.artifacts_dir.join("diff.patch")).expect("read diff.patch");
+        assert!(
+            diff_patch.contains("+turn1"),
+            "diff.patch should include turn1 addition"
+        );
+
+        let run_id_2 = "run-2";
+        let paths_2 = new_test_paths(&agentd_root, run_id_2);
+        let mut events_2 =
+            EventWriter::new(run_id_2.to_string(), paths_2.events_norm.clone()).expect("events");
+        let mut wu_2 = minimal_work_unit();
+        wu_2.target.repo = source.to_string_lossy().to_string();
+        wu_2.target.base_ref = final_sha.clone();
+        wu_2.target.workspace_mode = WorkspaceMode::Worktree;
+        wu_2.acceptance.commands = vec!["grep -q 'turn1' README.md".to_string()];
+        let spec_2 = Spec {
+            path: "run-2.json".to_string(),
+            hash: "hash-2".to_string(),
+        };
+
+        let out_2 = execute(&wu_2, run_id_2, &spec_2, &paths_2, &mut events_2).expect("run 2");
+        assert_eq!(out_2.status, RunStatus::Ok);
+
+        let readme = fs::read_to_string(paths_2.workspace_dir.join("README.md"))
+            .expect("read README.md from run2 workspace");
+        assert!(readme.contains("turn1"));
     }
 
     #[test]

@@ -10,7 +10,7 @@ runs/<run_id>/
 ├── events.norm.jsonl      # normalized kernel events (event registry)
 ├── env_fingerprint.json   # toolchain snapshot
 ├── artifacts/
-│   ├── diff.patch         # unified diff vs base_ref (may be empty)
+│   ├── diff.patch         # unified diff for workspace.base_sha..workspace.final_sha (may be empty)
 │   ├── changed_files.json # JSON array of changed file paths
 │   ├── commits.json       # list of commits created (may be [] when none or want_commits=false)
 │   └── agent_final.md     # optional final assistant message from driver
@@ -58,7 +58,10 @@ Skipped artifacts are recorded in `events.norm.jsonl` as `artifact.skipped`.
     "mode": "scratch | worktree | clone",
     "path": "/runner/worktrees/01J...",
     "branch": "agentctl-run-01J...-builder",
-    "base_ref": "main"
+    "base_ref": "main",
+    "base_sha": "6f1a...",
+    "final_sha": "d4c9...",
+    "continuation_ref": "refs/agentctl/continuations/01J0EXAMPLE"
   },
   "budgets_used": {
     "wall_seconds": 12,
@@ -77,6 +80,12 @@ Skipped artifacts are recorded in `events.norm.jsonl` as `artifact.skipped`.
   }
 }
 ```
+
+`workspace.base_sha` is the exact commit checked out at run start for git-backed runs.
+`workspace.final_sha` is the exact commit representing the final workspace state. If the run ends dirty/untracked, kernel creates a synthetic snapshot commit and records it here.
+`workspace.continuation_ref` is a kernel-managed ref pointing at `workspace.final_sha` so the snapshot remains reachable.
+For continuation, set next run `target.base_ref` to the prior `workspace.final_sha`.
+`artifacts/commits.json` includes agent-created commits only; kernel synthetic snapshot commits are excluded.
 
 `agent_session_id` is optional and records the driver session/thread identifier when available (for `codex_exec`, this is the `thread.started.thread_id` value).
 `artifacts.agent_final` is optional and records the driver-provided final assistant message when available.

@@ -50,7 +50,10 @@
         "mode": {"type": "string", "enum": ["scratch", "worktree", "clone"]},
         "path": {"type": "string"},
         "branch": {"type": ["string", "null"]},
-        "base_ref": {"type": ["string", "null"]}
+        "base_ref": {"type": ["string", "null"]},
+        "base_sha": {"type": ["string", "null"]},
+        "final_sha": {"type": ["string", "null"]},
+        "continuation_ref": {"type": ["string", "null"]}
       }
     },
     "budgets_used": {
